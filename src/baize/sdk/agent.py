@@ -29,6 +29,12 @@ from baize.compressor import CompressorConfig, ToolOutputCompressor
 from baize.services import get as _svc_get
 from baize.sandbox import PermissionLevel
 
+
+def _import_try_auto_install():
+    """惰性导入，避免 baize.tools ↔ baize.sdk.agent 循环依赖。"""
+    from baize.tools.auto_install import try_auto_install
+    return try_auto_install
+
 logger = logging.getLogger("baize.agent")
 
 
@@ -123,10 +129,37 @@ def _tool_missing_hint(name: str, exc: Exception) -> str:
     if any(k in msg for k in ("command not found", "not found", "No such file or directory")):
         return (
             f"(工具 {name} 执行失败: {type(exc).__name__}: {msg}。"
-            f"可能原因: 该系统依赖的二进制未安装。请在项目目录运行 ./install-tools.sh 预装工具，"
-            f"或手动安装对应命令后重试。)"
+            f"可能原因: 该系统依赖的二进制未安装。"
+            f"系统将尝试自动安装缺失依赖；如未自动触发，可在项目目录运行 "
+            f"./install-tools.sh 预装工具，或手动安装对应命令后重试。)"
         )
     return f"(工具 {name} 执行失败: {type(exc).__name__}: {msg})"
+
+
+def _extract_missing_binary(name: str, exc: Exception) -> Optional[str]:
+    """从工具执行异常中提取缺失的系统二进制名。
+
+    匹配常见报错形态:
+    - ``nmap: command not found``
+    - ``/bin/bash: nmap: command not found``
+    - ``[Errno 2] No such file or directory: 'nmap'``
+    """
+    msg = str(exc)
+    lower = msg.lower()
+    if "command not found" not in lower and "no such file or directory" not in lower:
+        return None
+    # 优先用工具函数名本身（nmap_scan → nmap）
+    # 安全工具函数名通常含 _scan/_check/_enum 等后缀，二进制名是前缀
+    candidate = name
+    for suffix in ("_scan", "_check", "_enum", "_audit", "_analyze",
+                   "_crack", "_run", "_lookup", "_query", "_capture"):
+        if candidate.endswith(suffix):
+            candidate = candidate[: -len(suffix)]
+            break
+    # 如果工具名本身就是已知二进制（如 nmap / sqlmap），直接用
+    if candidate and candidate.replace("-", ""):
+        return candidate
+    return None
 
 
 def _httpx_transport_exc_types() -> tuple[type[Exception], ...]:
@@ -1080,6 +1113,10 @@ class Agent:
                     if await self._maybe_retry_llm(exc, attempt, stream=True, produced=True):
                         yield CompletionResult(content="", reset=True)
                         continue
+                    # 重试耗尽：先发 reset 清空前端已渲染的半截内容，
+                    # 再抛出异常——确保 app.py 捕获后发 error 事件，
+                    # 前端不会残留"临时结果但一直转圈"的状态。
+                    yield CompletionResult(content="", reset=True)
                     raise
                 if not await self._maybe_retry_llm(exc, attempt, stream=True):
                     raise
@@ -1175,9 +1212,43 @@ class Agent:
                             except Exception as exc:  # noqa: BLE001
                                 # 工具异常隔离：工具自身抛出的异常不中断整轮对话，
                                 # 转为 tool 结果消息返回给模型，由模型决定重试或改道。
-                                output = _tool_missing_hint(name, exc)
-                                self._log_event("tool/error", name=name, error=str(exc))
-                                logger.warning("工具 %s 执行失败: %s: %s", name, type(exc).__name__, exc)
+                                # —— 工具缺失自洽修复 ——
+                                # 检测到 command not found / No such file 时，
+                                # 尝试自动安装缺失二进制并重试一次。
+                                missing_bin = _extract_missing_binary(name, exc)
+                                if missing_bin is not None:
+                                    sandbox = _svc_get("sandbox")
+                                    sid = self.session_log.session_id if self.session_log else self.session_id
+                                    logger.info("工具 %s 缺失二进制 %s，尝试自动安装", name, missing_bin)
+                                    self._log_event(
+                                        "tool/call", name="auto_install",
+                                        arguments=f'{{"binary": "{missing_bin}"}}',
+                                        call_id=f"install_{tc_id}",
+                                    )
+                                    install_ok, install_msg = await _import_try_auto_install()(
+                                        missing_bin,
+                                        sandbox=sandbox,
+                                        session_id=str(sid) if sid else "",
+                                    )
+                                    self._log_event(
+                                        "tool/result", name="auto_install",
+                                        output=install_msg, denied=not install_ok,
+                                    )
+                                    if install_ok:
+                                        # 安装成功：重试原工具调用一次
+                                        try:
+                                            output = await tool.execute(final_args)
+                                        except Exception as exc2:  # noqa: BLE001
+                                            output = _tool_missing_hint(name, exc2)
+                                            self._log_event("tool/error", name=name, error=str(exc2))
+                                            logger.warning("工具 %s 重试仍失败: %s", name, exc2)
+                                    else:
+                                        output = f"(自动安装 {missing_bin} 失败: {install_msg})"
+                                        self._log_event("tool/error", name=name, error=install_msg)
+                                else:
+                                    output = _tool_missing_hint(name, exc)
+                                    self._log_event("tool/error", name=name, error=str(exc))
+                                    logger.warning("工具 %s 执行失败: %s: %s", name, type(exc).__name__, exc)
                             duration = asyncio.get_running_loop().time() - started_at
                             self._log_event("tool/result", name=name, output=output, denied=False, duration=round(duration, 4))
                         await self._emit("on_tool_result", self, name, output)
@@ -1624,9 +1695,50 @@ class Agent:
                             except Exception as exc:  # noqa: BLE001
                                 # 工具异常隔离：工具自身抛出的异常不中断整轮对话，
                                 # 转为 tool 结果消息返回给模型，由模型决定重试或改道。
-                                output = _tool_missing_hint(name, exc)
-                                self._log_event("tool/error", name=name, error=str(exc))
-                                logger.warning("工具 %s 执行失败: %s: %s", name, type(exc).__name__, exc)
+                                # —— 工具缺失自洽修复 ——
+                                # 检测到 command not found / No such file 时，
+                                # 尝试自动安装缺失二进制并重试一次。
+                                missing_bin = _extract_missing_binary(name, exc)
+                                if missing_bin is not None:
+                                    sandbox = _svc_get("sandbox")
+                                    sid = self.session_log.session_id if self.session_log else self.session_id
+                                    logger.info("工具 %s 缺失二进制 %s，尝试自动安装", name, missing_bin)
+                                    yield AgentEvent(
+                                        type="tool_call",
+                                        tool_name="auto_install",
+                                        tool_args=f'{{"binary": "{missing_bin}"}}',
+                                        tool_call_id=f"install_{tc_id}",
+                                    )
+                                    install_ok, install_msg = await _import_try_auto_install()(
+                                        missing_bin,
+                                        sandbox=sandbox,
+                                        session_id=str(sid) if sid else "",
+                                    )
+                                    self._log_event(
+                                        "tool/result", name="auto_install",
+                                        output=install_msg, denied=not install_ok,
+                                    )
+                                    yield AgentEvent(
+                                        type="tool_result",
+                                        tool_name="auto_install",
+                                        tool_result=install_msg,
+                                        tool_call_id=f"install_{tc_id}",
+                                    )
+                                    if install_ok:
+                                        # 安装成功：重试原工具调用一次
+                                        try:
+                                            output = await tool.execute(final_args)
+                                        except Exception as exc2:  # noqa: BLE001
+                                            output = _tool_missing_hint(name, exc2)
+                                            self._log_event("tool/error", name=name, error=str(exc2))
+                                            logger.warning("工具 %s 重试仍失败: %s", name, exc2)
+                                    else:
+                                        output = f"(自动安装 {missing_bin} 失败: {install_msg})"
+                                        self._log_event("tool/error", name=name, error=install_msg)
+                                else:
+                                    output = _tool_missing_hint(name, exc)
+                                    self._log_event("tool/error", name=name, error=str(exc))
+                                    logger.warning("工具 %s 执行失败: %s: %s", name, type(exc).__name__, exc)
                             duration = asyncio.get_running_loop().time() - started_at
                             self._log_event("tool/result", name=name, output=output, denied=False, duration=round(duration, 4))
                         await self._emit("on_tool_result", self, name, output)
@@ -1661,7 +1773,9 @@ class Agent:
                         await self._trim_history_async(history, tool_schemas, client)
                         last_trim_msgs = len(history)
                     # 连续多轮纯工具调用后，追加"阶段性结论"提示，防止模型空转
-                    # 耗尽 max_tool_calls 而最终无文本输出（仅提示一次，避免刷屏）。
+                    # 耗尽 max_tool_calls 而最终无文本输出。
+                    # 两次触发：首次在 _CONCLUDE_HINT_TOOL_TURNS 轮后；接近上限时再次触发，
+                    # 确保模型在 max_tool_calls 耗尽前给出最终结论。
                     if (
                         tool_turns_since_conclusion >= _CONCLUDE_HINT_TOOL_TURNS
                         and not conclusion_hint_added
@@ -1671,6 +1785,22 @@ class Agent:
                             ChatMessage(
                                 role="user",
                                 content="（注意：已连续多轮调用工具。请基于已获得的工具结果给出阶段性结论与当前发现，并明确下一步的关键假设；不要继续无方向地重复探索或执行相似操作。）",
+                            )
+                        )
+                    elif (
+                        turn_index >= self.max_tool_calls - 3
+                        and not conclusion_hint_added
+                    ):
+                        # 接近上限（剩余 3 轮）：二次提示，强制收敛
+                        conclusion_hint_added = True
+                        history.append(
+                            ChatMessage(
+                                role="user",
+                                content=(
+                                    "（注意：即将达到工具调用次数上限（剩余约 3 轮）。"
+                                    "请立即停止调用新工具，基于已有结果给出最终结论与建议，"
+                                    "不要继续探索。）"
+                                ),
                             )
                         )
                     continue  # 继续请求模型，获取工具执行后的最终回复
@@ -1705,6 +1835,14 @@ class Agent:
                     continue
 
                 break
+
+            # 循环正常结束（未 break，即 max_tool_calls 耗尽）：附加上限说明
+            if not final_text and tool_calls_executed > 0:
+                final_text = (
+                    f"（已达工具调用次数上限 {self.max_tool_calls} 轮，本轮未产出最终文本。"
+                    "以上为已完成的工具调用过程，如需继续请重新提问或调整策略。）"
+                )
+                yield AgentEvent(type="text", content=final_text)
 
             yield AgentEvent(type="done", content=final_text)
             await self._emit("on_done", self, final_text)
