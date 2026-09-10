@@ -1450,18 +1450,24 @@ class Agent:
         user_message: str,
         context_variables: Optional[dict] = None,
         experience_block: Optional[str] = None,
+        suppress_session_end: bool = False,
+        audit_user_message: Optional[str] = None,
     ) -> RunResult:
         """执行一次完整对话。
 
         experience_block: 可选的"历史经验"文本块，插入到 system 指令之后，
             供模型参考以往渗透测试的复盘经验（仅供参考，不影响系统指令优先级）。
+        suppress_session_end: 为 True 时不在结束时写 session/end 日志
+            （编排器调用的临时 agent 不应写，由编排器统一管理）。
+        audit_user_message: 审计日志记录的用户原始输入（编排器模式下
+            user_message 可能是改写后的 task，此参数保留原始输入用于审计）。
         """
         ctx = self._merged_context(context_variables)
         await self._emit("on_start", self, user_message, ctx)
         # 新一轮开始：重置沙箱的单轮危险工具配额
         self._reset_sandbox_turn()
         self._ensure_session_started()
-        self._log_event("user/message", content=user_message)
+        self._log_event("user/message", content=audit_user_message or user_message)
         try:
             client = self._resolve_client()
             history = self._build_history(user_message, ctx)
@@ -1476,7 +1482,7 @@ class Agent:
             # ── 经验自动提炼 (P1) ──
             await self._try_auto_refine(client, user_message, content)
 
-            self._log_event("session/end", reason="done")
+            self._log_event("session/end", reason="done") if not suppress_session_end else None
             self._save_memory(history, content)
 
             return RunResult(
@@ -1486,7 +1492,8 @@ class Agent:
             )
         except Exception as exc:  # noqa: BLE001
             await self._emit("on_error", self, exc)
-            self._log_event("session/end", reason="error", error=str(exc))
+            if not suppress_session_end:
+                self._log_event("session/end", reason="error", error=str(exc))
             raise
 
     async def run_stream(
@@ -1497,6 +1504,8 @@ class Agent:
         extra_tools: Optional[list[AgentTool]] = None,
         user_chat_message: Optional[ChatMessage] = None,
         experience_block: Optional[str] = None,
+        suppress_session_end: bool = False,
+        audit_user_message: Optional[str] = None,
     ) -> AsyncIterator[AgentEvent]:
         """流式执行对话，逐步产出事件（支持实时思考、工具调用与上下文延续）。
 
@@ -1509,13 +1518,23 @@ class Agent:
             否则用 user_message 字符串构造。
         experience_block: 可选的"历史经验"文本块，插入到 system 指令之后，
             供模型参考以往渗透测试的复盘经验。
+        suppress_session_end: 为 True 时不在结束时写 session/end 日志。
+            编排器（ConversationOrchestrator）每步都会创建临时 agent 调
+            run_stream，若每次都写 session/end 会导致单条用户消息内
+            出现多次 session/end（如 audit log seq=14 与 seq=26），
+            真正的会话结束应由编排器在 done 时统一写一次。
+        audit_user_message: 审计日志记录的用户原始输入。
+            编排器模式下，run_stream 的 user_message 是 reason LLM 改写后的
+            子任务 task，但审计日志的 user/message 事件应记录用户真实输入，
+            否则攻击图时间线会显示"用户发了工具指令"而非原始需求。
+            未提供时回退到 user_message。
         """
         ctx = self._merged_context(context_variables)
         await self._emit("on_start", self, user_message, ctx)
         # 新一轮开始：重置沙箱的单轮危险工具配额
         self._reset_sandbox_turn()
         self._ensure_session_started()
-        self._log_event("user/message", content=user_message)
+        self._log_event("user/message", content=audit_user_message or user_message)
         try:
             client = self._resolve_client()
             if user_chat_message is not None:
@@ -1848,9 +1867,11 @@ class Agent:
             await self._emit("on_done", self, final_text)
             # ── 经验自动提炼 (P1) ──
             await self._try_auto_refine(client, user_message, final_text)
-            self._log_event("session/end", reason="done")
+            if not suppress_session_end:
+                self._log_event("session/end", reason="done")
             self._save_memory(history, final_text)
         except Exception as exc:  # noqa: BLE001
             await self._emit("on_error", self, exc)
-            self._log_event("session/end", reason="error", error=str(exc))
+            if not suppress_session_end:
+                self._log_event("session/end", reason="error", error=str(exc))
             raise

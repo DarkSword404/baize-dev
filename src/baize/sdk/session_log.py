@@ -118,6 +118,12 @@ class SessionLog:
                 payload.setdefault("origin", self.origin)
             if self.goal is not None:
                 payload.setdefault("goal", self.goal)
+        # 防重复：session/end 只写一次（异常传播可能导致多次触发）
+        if kind == "session/end":
+            for ev in reversed(self._events):
+                if ev.kind == "session/end":
+                    # 已有 session/end，跳过重复写入
+                    return ev
         event = SessionEvent(seq=self._seq, kind=kind, payload=payload)
         self._seq += 1
         self._events.append(event)
