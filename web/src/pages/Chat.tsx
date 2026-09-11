@@ -120,10 +120,26 @@ function buildChatMessage(h: any, fallbackTimestamp: string): ChatMessageType | 
 
   // ── 正常对话消息（无 type 字段：用户提问 / 助手最终回复） ──
   if (h.role === 'user' || h.role === 'assistant') {
+    const content = extractContentText(h.content);
+    // 兼容旧数据：assistant 消息可能带 reasoning_trace 字段但无独立 intermediate 消息。
+    // 将 trace 作为 reasoning 中间产物恢复，使旧会话也能回溯思考过程。
+    if (h.role === 'assistant' && h.reasoning_trace && !h.type) {
+      return {
+        id: genId(),
+        role: 'assistant',
+        content,
+        timestamp: ts,
+        intermediates: [{
+          itemType: 'reasoning' as const,
+          label: '💭 思考过程（历史记录）',
+          detail: h.reasoning_trace,
+        }],
+      };
+    }
     return {
       id: genId(),
       role: h.role,
-      content: extractContentText(h.content),
+      content,
       timestamp: ts,
     };
   }
@@ -803,7 +819,7 @@ export function Chat(): JSX.Element {
                     ? 'bg-purple-600/10 border-purple-600/20 text-purple-400'
                     : 'bg-gray-800/50 border-gray-700 text-gray-500 hover:text-gray-300 hover:border-gray-600'
                 }`}
-                title="攻击地图（黑板 Fact-Intent 图，协作模式会话可用）"
+                title="攻击证据图（目标多版本 · 假设分支泳道 · 证据/动作 · 轮末交接卡）"
               >
                 攻击图
               </button>
@@ -1087,7 +1103,7 @@ export function Chat(): JSX.Element {
         </div>
       )}
 
-      {/* ═══ 攻击地图侧栏（黑板 Fact-Intent 图，协作模式会话可用）═══ */}
+      {/* ═══ 攻击证据图侧栏（分支泳道图 + 交接卡，协作模式会话可用）═══ */}
       <AttackMap
         sessionId={activeSessionId}
         open={attackMapOpen}

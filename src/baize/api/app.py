@@ -540,6 +540,14 @@ async def _with_sse_heartbeat(agen, interval: float = 15.0):
 
 
 # ----------------------------------------------------------------------
+# 会话运行任务单飞表：session_id -> 当前正在运行的 SSE 协程任务。
+# 用户在旧回复还没结束时又发消息（或刷新页面后重发），新请求会取消旧任务，
+# 避免多个编排器/agent 重叠运行：抢共享浏览器锁、重复扫描目标、疯狂烧 token。
+# ----------------------------------------------------------------------
+_active_session_tasks: dict[str, "asyncio.Task"] = {}
+
+
+# ----------------------------------------------------------------------
 # 会话审计日志：SessionLog 生产接线辅助
 # ----------------------------------------------------------------------
 def _get_or_create_session_log(app: FastAPI, session_id: str) -> SessionLog:
@@ -1630,6 +1638,55 @@ def create_baize_api_app(
 
             # ── 对话模式：黑板驱动的动态 agent 自动编排（不使用流水线模板）──
             if use_conversation_orchestrator:
+                # ── 单飞：同会话新消息取消旧的运行任务（旧版旧流不死，
+                # 多个 agent 重叠抢浏览器锁、重复扫描、烧 token，最终挂死）──
+                current_task = asyncio.current_task()
+                old_task = _active_session_tasks.pop(session_id, None)
+                if old_task is not None and old_task is not current_task and not old_task.done():
+                    old_task.cancel()
+                    logger.info("会话 %s 的旧运行任务被新消息取消", session_id)
+                _active_session_tasks[session_id] = current_task  # type: ignore[assignment]
+
+                stream = None
+                draft_finalized = False
+                intermediates_saved = False  # 防止 intermediate 消息重复写入
+
+                def _persist_draft(*, finished: bool, note: str = "") -> None:
+                    """把当前正文+思考过程+工具轨迹落盘（中断/异常也不丢内容）。
+
+                    与非编排路径的 _flush_to_session 不同，编排路径走
+                    save_assistant_draft + intermediate 消息双写：
+                    - reasoning_parts → intermediate 消息（前端可回溯思考）
+                    - tool_events → intermediate 消息（前端可回溯工具调用）
+                    - final_text → assistant 正文
+                    - reasoning_trace → 草稿字段（兼容旧前端）
+                    """
+                    nonlocal draft_finalized, intermediates_saved
+                    if draft_finalized:
+                        return
+                    body = final_text
+                    if note:
+                        body = (body + note) if body else note
+                    trace = "\n".join(reasoning_parts)[-8000:]
+                    # 思考过程 + 工具轨迹存为 intermediate 消息（仅写一次，
+                    # 防止 phase 事件多次调用 _persist_draft(finished=False) 时重复）
+                    if not intermediates_saved and (reasoning_parts or tool_events):
+                        if reasoning_parts:
+                            sm.append_message(
+                                session_id, "intermediate", "",
+                                extra={
+                                    "type": "reasoning",
+                                    "summary": [{"text": "".join(reasoning_parts)}],
+                                },
+                            )
+                        for ev in tool_events:
+                            sm.append_message(session_id, "intermediate", "", extra=ev)
+                        intermediates_saved = True
+                    # 正文 + trace 草稿（草稿可反复更新，只保留最新版本）
+                    if body.strip() or trace.strip():
+                        sm.save_assistant_draft(session_id, body, trace, finished=finished)
+                        draft_finalized = finished
+
                 try:
                     from baize.pentest.conversation_orchestrator import ConversationOrchestrator
                     # 内置智能体已废弃 — 普通对话无 blackboard 时即时构造一个，
@@ -1643,8 +1700,9 @@ def create_baize_api_app(
                         except Exception:  # noqa: BLE001
                             pass
                     orch = ConversationOrchestrator()
-                    # 浏览器协作工具追加到 extra_tools（已在上方组装）
-                    async for kind, event in _with_sse_heartbeat(
+                    # 心跳包装器在 finally 中会级联 aclose 内部编排器生成器，
+                    # 从而取消正在运行的 agent / LLM 请求 / 浏览器协程。
+                    stream = _with_sse_heartbeat(
                         orch.run(
                             blackboard,
                             payload.input,
@@ -1653,7 +1711,8 @@ def create_baize_api_app(
                             extra_tools=extra_tools,
                         ),
                         interval=10.0,
-                    ):
+                    )
+                    async for kind, event in stream:
                         if await request.is_disconnected():
                             break
                         if kind == "heartbeat":
@@ -1676,6 +1735,9 @@ def create_baize_api_app(
                                 f"event: reasoning_step\n"
                                 f"data: {json.dumps({'type': 'pipeline_step', 'phase': phase, 'phase_name': name, 'agent': agent_name})}\n\n"
                             )
+                            # 每轮开始即把已有产出落盘（黑板随 _save 一起持久化），
+                            # 此后任何中断都能从磁盘恢复出"进行到一半"的回复。
+                            _persist_draft(finished=False)
                         elif ev_type == "delta":
                             content = ev_data.get("content", "")
                             final_text += content
@@ -1685,16 +1747,44 @@ def create_baize_api_app(
                             yield f"data: {json.dumps({'type': 'error', 'error': err})}\n\n"
                         elif ev_type == "done":
                             content = ev_data.get("content", "")
-                            _flush_to_session()
-                            yield f"data: {json.dumps({'type': 'done', 'content': content or final_text})}\n\n"
-                    _flush_to_session()
+                            final_text = content or final_text
+                            _persist_draft(finished=True)
+                            yield f"data: {json.dumps({'type': 'done', 'content': final_text})}\n\n"
+                    # 流正常耗尽或客户端断连：把半成品定稿保存（旧版此处对
+                    # 断连虽 flush，但 agent 全程无正文时 final_text 为空，
+                    # 工具轨迹也从不入库 → 刷新后只剩用户消息）。
+                    if not draft_finalized:
+                        _persist_draft(
+                            finished=True,
+                            note="\n\n_（任务在此处中断，已保留以上执行过程；"
+                                 "回复「继续」可从黑板状态接着执行。）_" if not final_text.strip() else "",
+                        )
                     yield "data: [DONE]\n\n"
                     return
+                except asyncio.CancelledError:
+                    # 被同会话新消息取代：保留草稿后重新抛出，禁止再 yield SSE
+                    logger.info("对话编排被取消（session=%s），已保存执行草稿", session_id)
+                    _persist_draft(
+                        finished=True,
+                        note="\n\n_（已被新消息中断；回复「继续」可从黑板状态接着执行。）_",
+                    )
+                    raise
                 except Exception as e:  # noqa: BLE001
                     logger.exception("对话自动编排处理失败: %s", e)
+                    # 旧版异常路径直接返回，assistant 内容全部丢失；先落盘再报错
+                    _persist_draft(
+                        finished=True,
+                        note=f"\n\n⚠️ **执行中断**：{_format_detailed_error(e, '对话编排')}",
+                    )
                     yield f"data: {json.dumps({'type': 'error', 'error': _format_detailed_error(e, '对话编排')})}\n\n"
                     yield "data: [DONE]\n\n"
                     return
+                finally:
+                    if stream is not None:
+                        # 级联关闭编排器生成器，确保内部 agent/LLM/浏览器协程被取消
+                        await stream.aclose()
+                    if _active_session_tasks.get(session_id) is current_task:
+                        _active_session_tasks.pop(session_id, None)
 
             try:
                 # 会话 ID 已在克隆副本上绑定（沙箱审批 / 记忆 / 审计日志均可识别当前会话）

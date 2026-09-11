@@ -110,12 +110,92 @@ async def http_probe(
     follow_redirects: bool = False,
     timeout: int = 30,
 ) -> str:
-    """httpx Web 服务存活探测与指纹。"""
-    args = ["-silent", "-title", "-web-server", "-tech-detect", "-status-code"]
-    if follow_redirects:
-        args.append("-follow-redirects")
-    args.append(target)
-    return await _run_tool("httpx", "httpx", args, timeout=timeout)
+    """Web 服务存活探测与指纹（Python httpx 实现，不依赖外部 httpx CLI）。
+
+    target 支持逗号分隔多个 URL；输出每台主机的状态码/标题/Server/技术栈。
+    """
+    import re as _re
+
+    import httpx as _httpx
+
+    targets = [t.strip() for t in str(target).replace("\n", ",").split(",") if t.strip()]
+    if not targets:
+        return "未提供有效目标"
+
+    # 不带 scheme 的目标默认走 https（失败再由调用方自行尝试 http）
+    norm_targets = []
+    for t in targets:
+        if not t.startswith(("http://", "https://")):
+            t = "https://" + t
+        norm_targets.append(t)
+
+    # 简易技术栈识别：响应头 + cookie 名 + HTML 特征
+    def _detect_tech(resp: _httpx.Response, body: str) -> list[str]:
+        tech: list[str] = []
+        header_blob = "\n".join(f"{k}: {v}" for k, v in resp.headers.items()).lower()
+        cookies = "; ".join(resp.cookies.keys()).lower()
+        checks = [
+            ("nginx", "nginx"), ("apache", "apache"), ("iis", "microsoft-iis"),
+            ("tomcat", "tomcat"), ("jboss", "jboss"), ("weblogic", "weblogic"),
+            ("php", "php"), ("asp.net", "asp.net"), ("jsp", "jsp"),
+            ("shiro", "rememberme"), ("spring", "spring"),
+            ("vue", "vue"), ("react", "react"), ("angular", "angular"),
+            ("jquery", "jquery"), ("bootstrap", "bootstrap"),
+            ("jenkins", "jenkins"), ("grafana", "grafana"),
+        ]
+        haystack = header_blob + "\n" + cookies + "\n" + body[:5000].lower()
+        for name, sig in checks:
+            if sig in haystack and name not in tech:
+                tech.append(name)
+        return tech
+
+    lines: list[str] = []
+    async with _httpx.AsyncClient(
+        timeout=timeout,
+        follow_redirects=follow_redirects,
+        verify=False,  # 渗透目标常用自签名证书
+    ) as client:
+        for url in norm_targets:
+            try:
+                resp = await client.get(url)
+                body = resp.text[:20000]
+                m = _re.search(r"<title[^>]*>(.*?)</title>", body, _re.I | _re.S)
+                title = _re.sub(r"\s+", " ", m.group(1)).strip()[:80] if m else ""
+                server = resp.headers.get("server", "")
+                powered = resp.headers.get("x-powered-by", "")
+                tech = ",".join(_detect_tech(resp, body))
+                lines.append(
+                    f"[{resp.status_code}] {url}"
+                    + (f" | {title}" if title else "")
+                    + (f" | Server: {server}" if server else "")
+                    + (f" | X-Powered-By: {powered}" if powered else "")
+                    + (f" | Tech: {tech}" if tech else "")
+                )
+            except _httpx.InvalidURL:
+                lines.append(f"[ERR] {url} | 无效 URL")
+            except Exception as exc:  # noqa: BLE001
+                # https 失败时自动回退 http 再试一次
+                if url.startswith("https://"):
+                    http_url = "http://" + url[len("https://"):]
+                    try:
+                        resp = await client.get(http_url)
+                        body = resp.text[:20000]
+                        m = _re.search(r"<title[^>]*>(.*?)</title>", body, _re.I | _re.S)
+                        title = _re.sub(r"\s+", " ", m.group(1)).strip()[:80] if m else ""
+                        server = resp.headers.get("server", "")
+                        tech = ",".join(_detect_tech(resp, body))
+                        lines.append(
+                            f"[{resp.status_code}] {http_url} (http回退)"
+                            + (f" | {title}" if title else "")
+                            + (f" | Server: {server}" if server else "")
+                            + (f" | Tech: {tech}" if tech else "")
+                        )
+                        continue
+                    except Exception as exc2:  # noqa: BLE001
+                        lines.append(f"[ERR] {url} | {type(exc2).__name__}: {str(exc2)[:100]}")
+                        continue
+                lines.append(f"[ERR] {url} | {type(exc).__name__}: {str(exc)[:100]}")
+    return "\n".join(lines)
 
 
 @register_tool(

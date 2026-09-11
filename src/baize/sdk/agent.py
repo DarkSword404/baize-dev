@@ -194,18 +194,57 @@ def _httpx_transport_exc_types() -> tuple[type[Exception], ...]:
     return tuple(exc_types)
 
 
+# DashScope / 阿里云百炼的内容安全拦截错误关键词。
+# 这类错误虽然是 400 状态码，但并非配置错误，而是服务端对输出内容的
+# 临时审核拦截（白泽做安全渗透场景很容易触发）。换个措辞或提高 temperature
+# 重新请求，大概率能过，因此应当标记为"可重试"。
+_DASHSCOPE_CONTENT_MODERATION_KEYWORDS: tuple[str, ...] = (
+    "DataInspectionFailed",
+    "DataInspection",
+    "ContentFilter",
+    "ContentModeration",
+    "inappropriate content",
+    "InternalError.Algo",
+)
+
+
+def _is_content_moderation_error(exc: Exception) -> bool:
+    """判断是否为 LLM 服务端返回的内容安全/内容审核类拦截错误。
+
+    典型特征：HTTP 400 + 错误码/错误信息包含审核关键词。
+    这类错误不是配置问题，而是输出内容临时触达安全阈值，
+    轻微调整（重试换措辞）即可绕过。
+    """
+    msg = str(exc)
+    # 先看 openai.APIStatusError 的 response body
+    response_body = ""
+    if isinstance(exc, openai.APIStatusError):
+        response_body = getattr(exc, "response", "")
+        if isinstance(response_body, (bytes, bytearray)):
+            response_body = response_body.decode("utf-8", errors="ignore")
+    haystack = f"{msg} {response_body}"
+    return any(kw.lower() in haystack.lower() for kw in _DASHSCOPE_CONTENT_MODERATION_KEYWORDS)
+
+
 def _is_retryable_llm_error(exc: Exception) -> bool:
     """判断 LLM 调用异常是否属于值得重试的临时性故障。
 
-    可重试：httpx / httpx2 网络层异常、openai 超时/连接错误/限流/HTTP 5xx。
-    不可重试：404/401/400/403 等配置类 4xx —— 重试无意义，
-    直接抛出交由上层诊断（例如 base_url 失效导致的 NotFoundError）。
+    可重试：
+    - httpx / httpx2 网络层异常
+    - openai 超时 / 连接错误 / 限流 / HTTP 5xx
+    - LLM 服务端内容安全拦截错误（DashScope DataInspectionFailed 等）
+      —— 虽然也是 400，但不是配置错，换措辞重试大概率过
+
+    不可重试：404/401/400/403 等配置类 4xx（base_url 失效、API key 错等）。
     """
     if isinstance(exc, _httpx_transport_exc_types()):
         return True
     if isinstance(exc, (openai.APITimeoutError, openai.APIConnectionError, openai.RateLimitError)):
         return True
     if isinstance(exc, openai.InternalServerError):
+        return True
+    # 内容安全拦截（400 但不是配置错）—— 可重试
+    if _is_content_moderation_error(exc):
         return True
     if isinstance(exc, openai.APIStatusError):
         status = getattr(exc, "status_code", None)
@@ -466,6 +505,41 @@ class Agent:
     session_log: Optional[SessionLog] = None
     tool_output_compressor: Optional[ToolOutputCompressor] = None
     """工具输出语义压缩器（TokenJuice 风格）。None 表示不压缩。"""
+    dynamic_tools: dict[str, "AgentTool"] = field(default_factory=dict)
+    """运行时按需加载的工具注册表（load_tool 元工具写入）。
+
+    两级工具体系的第二级：self.tools 是开局全 schema 绑定的工具集
+    （核心层 + Reason 预加载），dynamic_tools 是 agent 执行过程中通过
+    load_tool 自取的工具。每次 LLM 请求前合并，因此 agent 在第 N 轮
+    加载的工具，第 N+1 轮的请求立即带上完整 schema。
+    """
+
+    def mount_dynamic_tool(self, tool: "AgentTool") -> bool:
+        """挂载一个运行时加载的工具。已存在（核心层/已加载）则返回 False。"""
+        if tool.name in self.dynamic_tools:
+            return False
+        if any(t.name == tool.name for t in self.tools):
+            return False
+        self.dynamic_tools[tool.name] = tool
+        return True
+
+    def _merge_dynamic_tools(
+        self,
+        tools: list["AgentTool"],
+        tool_by_name: dict[str, "AgentTool"],
+    ) -> bool:
+        """把运行时加载的工具合并进当前工具集/映射，返回是否有新增。
+
+        在工具循环每次 LLM 请求前调用：agent 上一轮通过 load_tool
+        挂载的工具，本轮请求立即携带完整 JSON schema。
+        """
+        changed = False
+        for name, tool in self.dynamic_tools.items():
+            if name not in tool_by_name:
+                tools.append(tool)
+                tool_by_name[name] = tool
+                changed = True
+        return changed
 
     # ------------------------------------------------------------------
     # 钩子触发与记忆辅助
@@ -1136,7 +1210,11 @@ class Agent:
            消息不足 ``_TRIM_DEBOUNCE_MSGS`` 条不重复裁剪，避免抖动）。
         4. 继续请求，直到模型停止调用工具（finish_reason=stop）。
         """
-        tool_by_name = {t.name: t for t in self.tools}
+        all_tools = list(self.tools)
+        for _n, _t in self.dynamic_tools.items():
+            if not any(x.name == _n for x in all_tools):
+                all_tools.append(_t)
+        tool_by_name = {t.name: t for t in all_tools}
         total = CompletionUsage()
         last_trim_msgs = len(history)
         _, max_message_chars, _ = self._context_budget()
@@ -1144,6 +1222,10 @@ class Agent:
         turn_index = 0
         forced_conclusion = False  # 空回复兜底：最多强制续写一次
         for _ in range(self.max_tool_calls):
+            # 合并 agent 上一轮通过 load_tool 挂载的工具，下一次 LLM
+            # 请求立即携带其完整 schema（两级工具体系动态加载点）。
+            if self._merge_dynamic_tools(all_tools, tool_by_name):
+                tool_schemas = [t.to_schema() for t in all_tools]
             turn_index += 1
             self._log_event("turn/start", index=turn_index)
             self._log_event(
@@ -1576,6 +1658,9 @@ class Agent:
             turn_index = 0
 
             for _ in range(self.max_tool_calls):
+                # 动态工具合并：本轮 load_tool 挂载的工具，下一次 LLM 请求生效
+                if self._merge_dynamic_tools(tools, tool_by_name):
+                    tool_schemas = [t.to_schema() for t in tools]
                 turn_index += 1
                 self._log_event("turn/start", index=turn_index)
                 self._log_event(

@@ -75,17 +75,21 @@ export interface CreateSessionRequest {
   goal?: string;
 }
 
-// ---- 黑板（协作模式攻击图）----
+// ---- 黑板（证据攻击图：target/hypothesis/evidence/action/handoff）----
+export type BlackboardNodeKind =
+  | 'origin' | 'goal' | 'target' | 'hypothesis'
+  | 'intent' | 'action' | 'evidence' | 'fact' | 'handoff' | 'hint';
+
 export interface BlackboardNode {
   id: string;
-  kind: 'origin' | 'fact' | 'intent' | 'goal' | 'hint';
+  kind: BlackboardNodeKind | string;
   label: string;
   detail: string;
   status: string;
   discovered_by: string;
   created_at: string;
   updated_at: string;
-  properties: Record<string, unknown>;
+  properties: Record<string, any>;
 }
 
 export interface BlackboardEdge {
@@ -109,6 +113,14 @@ export interface BlackboardSnapshot {
     intents_pending: number;
     intents_done: number;
     hints: number;
+    targets_active?: number;
+    hypotheses_pending?: number;
+    hypotheses_confirmed?: number;
+    hypotheses_refuted?: number;
+    evidence?: number;
+    actions?: number;
+    handoffs?: number;
+    branches?: number;
   };
 }
 

@@ -26,3 +26,4 @@ api_auth.json.key
 .env
 .env.*
 !*.env.example
+web/.vite/

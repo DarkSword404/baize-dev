@@ -207,6 +207,53 @@ class SessionManager:
         session = self._sessions.get(session_id)
         return session.messages if session else []
 
+    def save_assistant_draft(
+        self,
+        session_id: str,
+        content: str,
+        reasoning_trace: str = "",
+        *,
+        finished: bool = False,
+    ) -> Session | None:
+        """增量保存/定稿 assistant 回复草稿。
+
+        流式执行期间反复调用：同一条草稿消息被原地更新，保证任务中断、
+        客户端断连或服务异常时，已产出的正文与工具轨迹不会全部丢失
+        （旧实现只在流正常结束时落盘，中断后前端只剩用户消息）。
+
+        - 首次调用创建 ``draft=True`` 的 assistant 消息；
+        - finished=True 时去掉 draft 标志（正式回复定稿）。
+        """
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                return None
+            draft: Optional[dict] = None
+            for m in reversed(session.messages):
+                if m.get("role") == "assistant" and m.get("draft"):
+                    draft = m
+                    break
+                # 只回看本轮（遇到上一条正式消息就停止）
+                if m.get("role") in ("user", "assistant"):
+                    break
+            if draft is None:
+                draft = {
+                    "role": "assistant",
+                    "content": "",
+                    "timestamp": _now(),
+                    "draft": True,
+                }
+                session.messages.append(draft)
+            draft["content"] = content or ""
+            # 工具/思考轨迹可能很长，只保留尾部窗口供回放排障
+            if reasoning_trace:
+                draft["reasoning_trace"] = reasoning_trace[-8000:]
+            if finished:
+                draft.pop("draft", None)
+            session.updated_at = _now()
+            self._save(session)
+            return session
+
     def reset_messages(self, session_id: str) -> bool:
         with self._lock:
             session = self._sessions.get(session_id)

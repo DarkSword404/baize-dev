@@ -452,7 +452,10 @@ export function streamMessage(
                 currentEvent = '';
                 continue;
               }
-              if (parsed.text || parsed.content) {
+              // done 事件的 content 是最终全文的快照（用于持久化），
+              // 不应追加到 chunkText——否则会与 delta 累积的正文重复。
+              // 只有 delta / text 类型才追加。
+              if (parsed.type !== 'done' && (parsed.text || parsed.content)) {
                 chunkText += parsed.text || parsed.content || '';
               }
               if (parsed.final_output) {
