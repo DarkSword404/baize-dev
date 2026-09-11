@@ -1,0 +1,29 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+
+# Node
+node_modules/
+
+# 测试（本地验证用，不随发布仓库提交）
+tests/
+web/src/__tests__/
+
+# 运行残留
+logs/
+*.log
+*.pid
+.baize-data/
+
+# 本地敏感配置（运行期生成，勿提交）
+api_auth.json
+api_auth.json.key
+*.key
+.env
+.env.*
+!*.env.example
+web/.vite/
