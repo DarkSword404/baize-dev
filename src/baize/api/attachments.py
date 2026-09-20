@@ -16,6 +16,7 @@ import re
 import secrets
 import shutil
 import tarfile
+import threading
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -160,6 +161,20 @@ class AttachmentStore:
     def __init__(self, base_dir: Path | None = None) -> None:
         self._base_dir = base_dir or DEFAULT_BAIZE_DIR / "sessions"
         self._base_dir.mkdir(parents=True, exist_ok=True)
+        # B-27: 附件锁 - 每会话一把 RLock，保护索引/文件读写防止竞争。
+        # 并发上传/删除同一会话附件时，索引读写与文件落盘需互斥，
+        # 否则会出现"刚登记的附件读不到"或"删除时正被读"等竞态。
+        self._locks: dict[str, threading.RLock] = {}
+        self._locks_guard = threading.Lock()
+
+    def _get_lock(self, session_id: str) -> threading.RLock:
+        """B-27: 取（或惰性创建）会话级附件锁。"""
+        with self._locks_guard:
+            lock = self._locks.get(session_id)
+            if lock is None:
+                lock = threading.RLock()
+                self._locks[session_id] = lock
+            return lock
 
     # ------------------------------------------------------------------
     # 路径辅助
@@ -185,44 +200,46 @@ class AttachmentStore:
         data: bytes,
     ) -> Attachment:
         """保存上传的附件并登记到会话索引。"""
-        if len(data) > max_upload_bytes():
-            raise ValueError(f"附件超过大小限制（{max_upload_bytes() // 1024 // 1024}MB，"
-                             f"可通过环境变量 BAIZE_MAX_UPLOAD_MB 调大）")
-        if not is_allowed(filename):
-            raise ValueError(f"不支持的文件类型: {filename}")
+        # B-27: 附件锁 - 串行化同一会话的写操作
+        with self._get_lock(session_id):
+            if len(data) > max_upload_bytes():
+                raise ValueError(f"附件超过大小限制（{max_upload_bytes() // 1024 // 1024}MB，"
+                                 f"可通过环境变量 BAIZE_MAX_UPLOAD_MB 调大）")
+            if not is_allowed(filename):
+                raise ValueError(f"不支持的文件类型: {filename}")
 
-        # 路径穿越防护：仅保留文件名（basename），拒绝目录成分
-        safe_name = Path(filename.replace("\\", "/")).name.strip()
-        if not safe_name or safe_name in (".", ".."):
-            raise ValueError(f"非法文件名: {filename}")
+            # 路径穿越防护：仅保留文件名（basename），拒绝目录成分
+            safe_name = Path(filename.replace("\\", "/")).name.strip()
+            if not safe_name or safe_name in (".", ".."):
+                raise ValueError(f"非法文件名: {filename}")
 
-        file_id = secrets.token_hex(8)
-        fdir = self._file_dir(session_id, file_id)
-        fdir.mkdir(parents=True, exist_ok=True)
+            file_id = secrets.token_hex(8)
+            fdir = self._file_dir(session_id, file_id)
+            fdir.mkdir(parents=True, exist_ok=True)
 
-        # 原始文件（_safe_join 双重保险，确保写入路径在沙箱目录内）
-        orig_dir = fdir / "original"
-        orig = _safe_join(orig_dir, safe_name)
-        if orig is None:
-            raise ValueError(f"非法文件名: {filename}")
-        orig.parent.mkdir(parents=True, exist_ok=True)
-        orig.write_bytes(data)
+            # 原始文件（_safe_join 双重保险，确保写入路径在沙箱目录内）
+            orig_dir = fdir / "original"
+            orig = _safe_join(orig_dir, safe_name)
+            if orig is None:
+                raise ValueError(f"非法文件名: {filename}")
+            orig.parent.mkdir(parents=True, exist_ok=True)
+            orig.write_bytes(data)
 
-        file_type = detect_file_type(filename)
-        mime = IMAGE_MIME.get(Path(filename.lower()).suffix, "")
-        att = Attachment(
-            file_id=file_id,
-            filename=filename,
-            file_type=file_type,
-            mime=mime,
-            size=len(data),
-            path=str(orig),
-        )
-        # 登记索引
-        index = self._load_index(session_id)
-        index[file_id] = att.to_dict()
-        self._save_index(session_id, index)
-        return att
+            file_type = detect_file_type(filename)
+            mime = IMAGE_MIME.get(Path(filename.lower()).suffix, "")
+            att = Attachment(
+                file_id=file_id,
+                filename=filename,
+                file_type=file_type,
+                mime=mime,
+                size=len(data),
+                path=str(orig),
+            )
+            # 登记索引
+            index = self._load_index(session_id)
+            index[file_id] = att.to_dict()
+            self._save_index(session_id, index)
+            return att
 
     def _load_index(self, session_id: str) -> dict:
         p = self._index_path(session_id)
@@ -265,28 +282,35 @@ class AttachmentStore:
         return p
 
     def delete_attachment(self, session_id: str, file_id: str) -> bool:
-        index = self._load_index(session_id)
-        if file_id not in index:
-            return False
-        del index[file_id]
-        self._save_index(session_id, index)
-        fdir = self._file_dir(session_id, file_id)
-        if fdir.exists():
-            import shutil
+        # B-27: 附件锁 - 删除时持锁，避免与并发上传/读取竞争
+        with self._get_lock(session_id):
+            index = self._load_index(session_id)
+            if file_id not in index:
+                return False
+            del index[file_id]
+            self._save_index(session_id, index)
+            fdir = self._file_dir(session_id, file_id)
+            if fdir.exists():
+                import shutil
 
-            shutil.rmtree(fdir, ignore_errors=True)
-        return True
+                shutil.rmtree(fdir, ignore_errors=True)
+            return True
 
     def delete_session(self, session_id: str) -> None:
         """删除会话的所有附件（连同索引）。"""
-        idx = self._index_path(session_id)
-        if idx.exists():
-            idx.unlink()
-        sdir = self._base_dir / session_id
-        if sdir.exists():
-            import shutil
+        # B-27: 附件锁 - 整会话清理需持锁，避免与并发写竞争
+        with self._get_lock(session_id):
+            idx = self._index_path(session_id)
+            if idx.exists():
+                idx.unlink()
+            sdir = self._base_dir / session_id
+            if sdir.exists():
+                import shutil
 
-            shutil.rmtree(sdir, ignore_errors=True)
+                shutil.rmtree(sdir, ignore_errors=True)
+            # 清理锁本身，避免字典无限增长
+            with self._locks_guard:
+                self._locks.pop(session_id, None)
 
     # ------------------------------------------------------------------
     # 按类型读取（供 Agent 工具与图片注入使用）

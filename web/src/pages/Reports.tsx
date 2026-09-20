@@ -41,6 +41,18 @@ function inlineMd(text: string): string {
   return html;
 }
 
+/**
+ * F-16: 在已渲染 HTML 上做防御性清洗，剥离危险标签/事件属性/javascript: 协议。
+ * 渲染器已先行 escape，这里作为纵深防御。
+ */
+function sanitizeReportHtml(html: string): string {
+  return html
+    .replace(/<\s*(script|style|iframe|object|embed)[\s\S]*?<\/\s*\1\s*>/gi, '')
+    .replace(/<\s*(script|style|iframe|object|embed|link|meta)[^>]*>/gi, '')
+    .replace(/\son\w+\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)/gi, '')
+    .replace(/(href|src)\s*=\s*("|')\s*(javascript|vbscript):[^"']*\2/gi, '$1="#"');
+}
+
 function renderReportMarkdown(md: string): string {
   const lines = md.replace(/\r\n/g, '\n').split('\n');
   const out: string[] = [];
@@ -198,7 +210,8 @@ function renderReportMarkdown(md: string): string {
   if (inCode) {
     out.push(`<pre class="bg-gray-900 border border-gray-700 rounded-lg p-4 overflow-x-auto"><code>${codeBuf.join('\n')}</code></pre>`);
   }
-  return out.join('\n');
+  // F-16: 输出前做防御性清洗
+  return sanitizeReportHtml(out.join('\n'));
 }
 
 // ===========================================================================

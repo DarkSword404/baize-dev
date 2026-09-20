@@ -70,6 +70,30 @@
 .prose-chat ul, .prose-chat ol { padding-left: 1.25rem; margin: 0.25rem 0; }
 .prose-chat a { color: #60a5fa; text-decoration: underline; }
 
+/* F-05: 代码块语言标签 + 行号区视觉 */
+.prose-chat .code-block {
+  position: relative;
+  padding-top: 1.5rem;
+}
+.prose-chat .code-block .code-lang {
+  position: absolute;
+  top: 0.25rem;
+  right: 0.5rem;
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  font-size: 0.625rem;
+  letter-spacing: 0.05em;
+  color: #64748b;
+  background: rgba(15, 23, 42, 0.7);
+  padding: 0.05rem 0.4rem;
+  border-radius: 0.25rem;
+  pointer-events: none;
+}
+.prose-chat .code-block code {
+  display: block;
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  white-space: pre;
+}
+
 /* ===== Toast ===== */
 .toast-enter { animation: slide-in-right 0.3s ease-out; }
 .toast-exit { animation: slide-in-right 0.2s ease-in reverse forwards; }

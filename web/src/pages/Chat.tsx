@@ -178,6 +178,9 @@ export function Chat(): JSX.Element {
   // per-session abort controller：支持多个会话同时流式生成、互不干扰
   const abortRefs = useRef<Map<string, AbortController>>(new Map());
   const fileInputRef = useRef<HTMLInputElement>(null);
+  // F-07: 用户上滚阅读时收到的未读新消息计数
+  const [newMessageCount, setNewMessageCount] = useState(0);
+  const prevMsgCountRef = useRef(0);
   // 待发送附件（用户选择后先上传到会话，随下一条消息发送）
   const [pendingFiles, setPendingFiles] = useState<AttachmentInfo[]>([]);
   const [uploading, setUploading] = useState(false);
@@ -204,7 +207,10 @@ export function Chat(): JSX.Element {
 
   // Load sessions on mount; auto-restore last active session
   useEffect(() => {
-    listSessions().then(r => {
+    // F-09: 用 AbortController 取消过期请求，避免组件卸载后还触发 setState
+    const ac = new AbortController();
+    listSessions(ac.signal).then(r => {
+      if (ac.signal.aborted) return;
       setSessions(r.sessions);
       // Auto-restore last active session from localStorage
       // 消息加载统一交给下方 activeSessionId effect，避免重复请求
@@ -212,7 +218,10 @@ export function Chat(): JSX.Element {
       if (savedSessionId && r.sessions.some(s => s.id === savedSessionId)) {
         setActiveSessionId(savedSessionId);
       }
-    }).catch(() => {});
+    }).catch((err: any) => {
+      if (err?.name === 'AbortError') return;
+    });
+    return () => { ac.abort(); };
   }, []);
 
   // 会话切换时加载对应历史消息（缓存优先）。
@@ -221,20 +230,22 @@ export function Chat(): JSX.Element {
   useEffect(() => {
     if (!activeSessionId) return;
     if (messagesBySession[activeSessionId]) return;
-    let cancelled = false;
-    getSession(activeSessionId)
+    // F-09: 用户快速切换会话时取消未完成的旧请求，避免历史覆盖错乱
+    const ac = new AbortController();
+    getSession(activeSessionId, ac.signal)
       .then(detail => {
-        if (cancelled) return;
+        if (ac.signal.aborted) return;
         const msgs: ChatMessageType[] = detail.history
           .map((h: any) => buildChatMessage(h, detail.created_at))
           .filter(Boolean) as ChatMessageType[];
         setMessages(msgs);
       })
       .catch((err: any) => {
+        if (ac.signal.aborted || err?.name === 'AbortError') return;
         addToast({ type: 'error', title: '加载会话失败', message: err.message });
       });
     return () => {
-      cancelled = true;
+      ac.abort();
     };
   }, [activeSessionId, messagesBySession]);
 
@@ -252,6 +263,18 @@ export function Chat(): JSX.Element {
     }
   }, [messages]);
 
+  // F-07: 用户上滚阅读期间收到新消息 → 累计未读计数，回到底部自动清零
+  useEffect(() => {
+    const prev = prevMsgCountRef.current;
+    prevMsgCountRef.current = messages.length;
+    if (messages.length > prev && !autoScrollRef.current) {
+      setNewMessageCount(c => c + (messages.length - prev));
+    }
+    if (autoScrollRef.current) {
+      setNewMessageCount(0);
+    }
+  }, [messages]);
+
   // 监听消息容器滚动：用户上滚时暂停自动跟随，回到底部附近时恢复
   function handleMessagesScroll() {
     const el = messagesContainerRef.current;
@@ -259,9 +282,17 @@ export function Chat(): JSX.Element {
     const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 120;
     if (nearBottom) {
       autoScrollRef.current = true;
+      setNewMessageCount(0);
     } else {
       autoScrollRef.current = false;
     }
+  }
+
+  // F-07: 点击"新消息"按钮滚动到最新并清零未读计数
+  function handleScrollToLatest() {
+    autoScrollRef.current = true;
+    chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    setNewMessageCount(0);
   }
 
   const activeSession = sessions.find(s => s.id === activeSessionId);
@@ -338,6 +369,10 @@ export function Chat(): JSX.Element {
     // Reset multi-agent tracking on session switch
     setCurrentAgent(null);
     setPipelinePhases([]);
+    // F-07: 切换会话时重置未读计数与滚动跟随状态，避免误报"新消息"
+    autoScrollRef.current = true;
+    prevMsgCountRef.current = 0;
+    setNewMessageCount(0);
     // 消息加载由 activeSessionId effect 统一处理（缓存优先，不覆盖流式内容）
   }
 
@@ -531,7 +566,11 @@ export function Chat(): JSX.Element {
             } : m
           ));
         }
-      }
+      },
+      // F-02: SSE 断线重连成功时提示用户
+      () => {
+        addToast({ type: 'success', title: '连接已恢复', message: '流式通道已重连，继续接收内容' });
+      },
     );
     abortRefs.current.set(sid, controller);
   }
@@ -718,13 +757,13 @@ export function Chat(): JSX.Element {
         <div className="px-4 py-3 border-b border-gray-800 flex items-center justify-between">
           <h2 className="text-sm font-semibold text-gray-400">任务</h2>
           <div className="flex gap-1">
-            <button onClick={handleRefreshSessions} className="p-1.5 rounded-lg hover:bg-gray-800 text-gray-500 hover:text-gray-300 transition-colors" title="刷新">
-              <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth={1.5} viewBox="0 0 24 24">
+            <button onClick={handleRefreshSessions} aria-label="刷新任务列表" className="p-1.5 rounded-lg hover:bg-gray-800 text-gray-500 hover:text-gray-300 transition-colors" title="刷新">
+              <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth={1.5} viewBox="0 0 24 24" aria-hidden="true">
                 <path strokeLinecap="round" strokeLinejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
               </svg>
             </button>
-            <button onClick={() => setShowCreateModal(true)} className="p-1.5 rounded-lg hover:bg-gray-800 text-blue-400 hover:text-blue-300 transition-colors" title="新建任务">
-              <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+            <button onClick={() => setShowCreateModal(true)} aria-label="新建任务" className="p-1.5 rounded-lg hover:bg-gray-800 text-blue-400 hover:text-blue-300 transition-colors" title="新建任务">
+              <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24" aria-hidden="true">
                 <path strokeLinecap="round" d="M12 4v16m8-8H4" />
               </svg>
             </button>
@@ -751,9 +790,10 @@ export function Chat(): JSX.Element {
                 </div>
                 <button
                   onClick={e => handleDeleteSession(s.id, e)}
+                  aria-label={`归档任务 ${s.agent}`}
                   className="opacity-0 group-hover:opacity-100 p-1 rounded text-gray-600 hover:text-red-400 hover:bg-red-400/10 transition-all flex-shrink-0"
                 >
-                  <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+                  <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24" aria-hidden="true">
                     <path strokeLinecap="round" d="M6 6l12 12M18 6L6 18" />
                   </svg>
                 </button>
@@ -767,8 +807,8 @@ export function Chat(): JSX.Element {
       <div className="flex-1 flex flex-col min-w-0">
         {/* Chat Header */}
         <div className="px-5 py-3 border-b border-gray-800 flex items-center gap-3 bg-gray-900/30">
-          <button onClick={() => setSidebarOpen(!sidebarOpen)} className="p-1.5 rounded-lg hover:bg-gray-800 text-gray-500 transition-colors">
-            <svg className="w-5 h-5" fill="none" stroke="currentColor" strokeWidth={1.5} viewBox="0 0 24 24">
+          <button onClick={() => setSidebarOpen(!sidebarOpen)} aria-label={sidebarOpen ? '收起侧边栏' : '展开侧边栏'} className="p-1.5 rounded-lg hover:bg-gray-800 text-gray-500 transition-colors">
+            <svg className="w-5 h-5" fill="none" stroke="currentColor" strokeWidth={1.5} viewBox="0 0 24 24" aria-hidden="true">
               <path strokeLinecap="round" d={sidebarOpen ? 'M11 19l-7-7 7-7m8 14l-7-7 7-7' : 'M13 5l7 7-7 7M5 5l7 7-7 7'} />
             </svg>
           </button>
@@ -845,8 +885,8 @@ export function Chat(): JSX.Element {
                 {/* Pipeline phase indicator */}
                 {pipelinePhases.length > 0 && (
                   <div className="flex items-center gap-1 mt-1 overflow-x-auto">
-                    {pipelinePhases.map((p, i) => (
-                      <span key={i} className={`text-[10px] px-1.5 py-0.5 rounded flex items-center gap-0.5 flex-shrink-0 ${
+                    {pipelinePhases.map((p) => (
+                      <span key={`phase-${p.phase}`} className={`text-[10px] px-1.5 py-0.5 rounded flex items-center gap-0.5 flex-shrink-0 ${
                         p.agent === currentAgent ? 'bg-green-600/20 text-green-400' : 'bg-gray-800 text-gray-500'
                       }`}>
                         {p.agent === currentAgent && <span className="w-1 h-1 rounded-full bg-green-400" />}
@@ -863,6 +903,8 @@ export function Chat(): JSX.Element {
               )}
               <button
                 onClick={() => setReasoningPanelOpen(!reasoningPanelOpen)}
+                aria-label={`推理过程时间线面板${reasoningPanelOpen ? '（已展开）' : '（已收起）'}`}
+                aria-expanded={reasoningPanelOpen}
                 className={`px-3 py-1.5 text-xs rounded-lg border transition-colors ${
                   reasoningPanelOpen
                     ? 'bg-purple-600/10 border-purple-600/20 text-purple-400'
@@ -874,6 +916,8 @@ export function Chat(): JSX.Element {
               </button>
               <button
                 onClick={() => setBrowserPanelOpen(!browserPanelOpen)}
+                aria-label={`共享浏览器侧窗口${browserPanelOpen ? '（已展开）' : '（已收起）'}`}
+                aria-expanded={browserPanelOpen}
                 className={`px-3 py-1.5 text-xs rounded-lg border transition-colors ${
                   browserPanelOpen
                     ? 'bg-blue-600/10 border-blue-600/20 text-blue-400'
@@ -885,6 +929,8 @@ export function Chat(): JSX.Element {
               </button>
               <button
                 onClick={() => setAttackMapOpen(!attackMapOpen)}
+                aria-label={`证据攻击图${attackMapOpen ? '（已展开）' : '（已收起）'}`}
+                aria-expanded={attackMapOpen}
                 className={`px-3 py-1.5 text-xs rounded-lg border transition-colors ${
                   attackMapOpen
                     ? 'bg-purple-600/10 border-purple-600/20 text-purple-400'
@@ -909,7 +955,7 @@ export function Chat(): JSX.Element {
         </div>
 
         {/* Messages */}
-        <div className="flex-1 overflow-y-auto px-5 py-4" ref={messagesContainerRef} onScroll={handleMessagesScroll}>
+        <div className="flex-1 overflow-y-auto px-5 py-4" ref={messagesContainerRef} onScroll={handleMessagesScroll} style={messages.length > 100 ? { maxHeight: 'calc(100vh - 200px)' } : undefined}>
           {!activeSessionId ? (
             <div className="flex flex-col items-center justify-center h-full text-center">
               <div className="w-16 h-16 bg-gray-800 rounded-2xl flex items-center justify-center mb-4">
@@ -945,6 +991,18 @@ export function Chat(): JSX.Element {
             </div>
           )}
           <div ref={chatEndRef} />
+          {/* F-07: 用户上滚期间收到新消息时显示"新消息"按钮 */}
+          {newMessageCount > 0 && (
+            <button
+              type="button"
+              onClick={handleScrollToLatest}
+              aria-label={`滚动到最新消息，共 ${newMessageCount} 条未读`}
+              className="sticky bottom-4 left-1/2 -translate-x-1/2 mx-auto block px-3.5 py-1.5 rounded-full bg-blue-600 hover:bg-blue-500 text-white text-xs shadow-lg z-10 flex items-center gap-1.5"
+            >
+              <span aria-hidden="true">↓</span>
+              新消息{newMessageCount > 1 ? ` (${newMessageCount})` : ''}
+            </button>
+          )}
         </div>
 
         {/* Input */}
@@ -976,13 +1034,14 @@ export function Chat(): JSX.Element {
               <button
                 onClick={() => fileInputRef.current?.click()}
                 disabled={isStreaming || uploading}
+                aria-label="上传附件（图片/代码/压缩包/文档）"
                 className="h-12 w-12 flex items-center justify-center rounded-xl bg-gray-800 border border-gray-700 hover:border-blue-500 hover:bg-gray-700 text-gray-400 hover:text-blue-400 transition-colors flex-shrink-0 disabled:opacity-40"
                 title="上传附件（图片/代码/压缩包/文档）"
               >
                 {uploading ? (
-                  <svg className="w-5 h-5 animate-spin" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="M12 6v6m0 0v6m0-6h6m-6 0H6" /></svg>
+                  <svg className="w-5 h-5 animate-spin" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true"><path strokeLinecap="round" strokeLinejoin="round" d="M12 6v6m0 0v6m0-6h6m-6 0H6" /></svg>
                 ) : (
-                  <svg className="w-5 h-5" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+                  <svg className="w-5 h-5" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24" aria-hidden="true">
                     <path strokeLinecap="round" strokeLinejoin="round" d="M15.172 7l-6.586 6.586a2 2 0 102.828 2.828l6.414-6.586a4 4 0 00-5.656-5.656l-6.415 6.585a6 6 0 108.486 8.486L20.5 13" />
                   </svg>
                 )}
@@ -991,6 +1050,7 @@ export function Chat(): JSX.Element {
                 ref={fileInputRef}
                 type="file"
                 multiple
+                aria-label="选择附件文件"
                 className="hidden"
                 onChange={handlePickFiles}
               />
@@ -1000,6 +1060,7 @@ export function Chat(): JSX.Element {
                 onChange={e => setInput(e.target.value)}
                 onKeyDown={handleKeyDown}
                 disabled={false}
+                aria-label={isStreaming ? '介入指令输入框，按 Enter 发送' : '消息输入框，按 Enter 发送，Shift+Enter 换行'}
                 placeholder={isStreaming
                   ? '输入介入指令，引导 AI 调整方向... (Enter 发送)'
                   : '输入渗透指令... (Enter 发送，Shift+Enter 换行)'}
@@ -1020,19 +1081,21 @@ export function Chat(): JSX.Element {
                 <>
                   <button
                     onClick={handleCancel}
+                    aria-label="停止生成"
                     className="h-12 px-3 flex items-center gap-1.5 bg-red-600/10 hover:bg-red-600/20 text-red-400 text-xs rounded-xl border border-red-600/20 transition-colors flex-shrink-0"
                     title="停止生成"
                   >
-                    <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="1" /></svg>
+                    <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="1" /></svg>
                     <span className="hidden sm:inline">停止</span>
                   </button>
                   <button
                     onClick={handleSend}
                     disabled={!input.trim()}
+                    aria-label="介入并发送新指令"
                     className="h-12 px-3 flex items-center gap-1.5 bg-amber-600 hover:bg-amber-500 disabled:bg-gray-700 disabled:text-gray-600 text-white text-xs rounded-xl transition-all flex-shrink-0 active:scale-95"
                     title="介入并发送新指令"
                   >
-                    <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+                    <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24" aria-hidden="true">
                       <path strokeLinecap="round" strokeLinejoin="round" d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8" />
                     </svg>
                     <span className="hidden sm:inline">介入</span>
@@ -1042,9 +1105,10 @@ export function Chat(): JSX.Element {
                 <button
                   onClick={handleSend}
                   disabled={!input.trim()}
+                  aria-label="发送消息"
                   className="h-12 w-12 flex items-center justify-center bg-blue-600 hover:bg-blue-500 disabled:bg-gray-700 disabled:text-gray-600 rounded-xl transition-all flex-shrink-0 active:scale-95"
                 >
-                  <svg className="w-5 h-5" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+                  <svg className="w-5 h-5" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24" aria-hidden="true">
                     <path strokeLinecap="round" strokeLinejoin="round" d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8" />
                   </svg>
                 </button>
@@ -1065,8 +1129,8 @@ export function Chat(): JSX.Element {
                 <span className="text-[10px] bg-gray-800 px-1.5 py-0.5 rounded text-gray-500">{allSteps.length}步</span>
               )}
             </div>
-            <button onClick={() => setReasoningPanelOpen(false)} className="p-1 rounded hover:bg-gray-800 text-gray-600 hover:text-gray-400 transition-colors">
-              <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+            <button onClick={() => setReasoningPanelOpen(false)} aria-label="关闭推理时间线面板" className="p-1 rounded hover:bg-gray-800 text-gray-600 hover:text-gray-400 transition-colors">
+              <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24" aria-hidden="true">
                 <path strokeLinecap="round" d="M18 6L6 18M6 6l12 12" />
               </svg>
             </button>
@@ -1127,8 +1191,11 @@ export function Chat(): JSX.Element {
                     const colorClasses = `${c.bg} ${c.border}`;
                     const iconChar = isToolCall ? '🔧' : isToolOutput ? '📤' : isHandoff ? '🔄' : '•';
 
+                    // F-06: 用稳定复合 key 替代数组索引，避免新增/插入时组件状态错乱
+                    const stepKey = `${(step as any)._msgIdx}-${(step as any)._stepIdx}-${(step as any)._ts}`;
+
                     return (
-                      <div key={idx}>
+                      <div key={stepKey}>
                         {/* Agent group header */}
                         {isNewAgent && stepAgent && (
                           <div className="flex items-center gap-1.5 py-1 -ml-5">

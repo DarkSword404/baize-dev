@@ -16,15 +16,63 @@ from __future__ import annotations
 
 import inspect
 import json
+import logging
 import os
 import re
 import secrets
 import textwrap
-import traceback
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
 from baize.tools.registry import ToolSpec, registry, schema_from_signature
+
+logger = logging.getLogger(__name__)
+
+# B-40: 自定义工具 builtins 限制 —— 仅暴露安全子集给用户代码，
+# 阻止 open/eval/exec/__import__/compile 等危险内建，避免任意文件读写或代码注入。
+# 选型参考 Python 沙箱实践：保留数学/基本类型/字符串处理/集合/序列操作。
+_SAFE_BUILTINS: dict[str, Any] = {
+    # 基本类型与转换
+    "bool": bool, "int": int, "float": float, "str": str, "bytes": bytes,
+    "bytearray": bytearray, "complex": complex, "list": list, "tuple": tuple,
+    "set": set, "frozenset": frozenset, "dict": dict, "range": range,
+    "slice": slice, "type": type, "object": object,
+    # 数学/迭代
+    "abs": abs, "min": min, "max": max, "sum": sum, "round": round,
+    "pow": pow, "divmod": divmod, "len": len, "enumerate": enumerate,
+    "zip": zip, "map": map, "filter": filter, "sorted": sorted, "reversed": reversed,
+    "iter": iter, "next": next, "any": any, "all": all,
+    # 字符串/编码
+    "repr": repr, "ascii": ascii, "chr": chr, "ord": ord, "hex": hex, "oct": oct,
+    "bin": bin, "format": format, "hash": hash, "id": id,
+    # 集合运算
+    "getattr": getattr, "setattr": setattr, "hasattr": hasattr,
+    "isinstance": isinstance, "issubclass": issubclass,
+    # 常量
+    "True": True, "False": False, "None": None,
+    # 异常基类（允许 try/except 但禁用 SystemExit/BaseException 直接抛出系统级退出）
+    "Exception": Exception, "ValueError": ValueError, "TypeError": TypeError,
+    "KeyError": KeyError, "IndexError": IndexError, "AttributeError": AttributeError,
+    "RuntimeError": RuntimeError, "StopIteration": StopIteration,
+    "ZeroDivisionError": ZeroDivisionError, "ArithmeticError": ArithmeticError,
+    "LookupError": LookupError, "NotImplementedError": NotImplementedError,
+    # print 在此显式不放行（B-41：用户代码改用 logger），
+    # 改为通过 logger 命名空间输出，便于审计与级别过滤。
+    "print": lambda *a, **k: logger.info("custom_tool: %s", " ".join(str(x) for x in a)),
+}
+
+
+def _safe_namespace(extra: dict[str, Any] | None = None) -> dict[str, Any]:
+    """构造受限命名空间：仅注入安全 builtins 子集与指定额外符号。"""
+    ns: dict[str, Any] = {
+        "__name__": "baize_custom_tool",
+        "__builtins__": _SAFE_BUILTINS,
+    }
+    # 暴露 logging.Logger 给用户代码：B-41 print → logger 后必须可用
+    ns["logger"] = logging.getLogger("baize.custom_tool")
+    if extra:
+        ns.update(extra)
+    return ns
 
 
 # ===========================================================================
@@ -61,8 +109,12 @@ def _validate_code(code: str) -> Optional[str]:
 
 
 def _build_namespace(code: str) -> dict[str, Any]:
-    """在隔离命名空间中执行用户代码，返回命名空间。"""
-    namespace: dict[str, Any] = {"__name__": "baize_custom_tool"}
+    """在隔离命名空间中执行用户代码，返回命名空间。
+
+    B-40: 自定义工具 builtins 限制 —— 仅暴露安全子集，
+    避免用户代码调用 open/eval/exec/__import__ 等危险内建。
+    """
+    namespace = _safe_namespace()
     exec(compile(code, "<custom_tool>", "exec"), namespace)
     return namespace
 
@@ -302,8 +354,9 @@ class CustomToolStore:
                 self._register(rec)
                 count += 1
             except Exception:  # noqa: BLE001
-                print(f"[baize.custom_tools] 加载自定义工具失败: {rec.get('name')}")
-                traceback.print_exc()
+                # B-41: print 改 logger —— 启动期日志应走 logging 框架，
+                # 便于按 level 过滤、对接日志采集系统，而非散落 stdout。
+                logger.exception("加载自定义工具失败: %s", rec.get("name"))
         return count
 
 
@@ -312,17 +365,44 @@ class CustomToolStore:
 # ===========================================================================
 
 def _build_test_script(code: str, args_json: str, timeout: int) -> str:
-    """构造在子进程沙箱中执行的测试脚本。"""
+    """构造在子进程沙箱中执行的测试脚本。
+
+    B-40: 自定义工具 builtins 限制 —— 子进程同样注入受限 builtins，
+    避免试运行沙箱绕过：测试与正式加载使用同一套安全策略。
+    """
     return textwrap.dedent(f"""
-        import json, sys, traceback
+        import json, sys, traceback, logging
+        logging.basicConfig(level=logging.INFO, format="[custom_tool] %(message)s")
+        test_logger = logging.getLogger("baize.custom_tool")
+        # B-40: 受限 builtins，与正式执行环境一致
+        _SAFE_BUILTINS = {chr(123)}
+            'bool': bool, 'int': int, 'float': float, 'str': str, 'bytes': bytes,
+            'list': list, 'tuple': tuple, 'set': set, 'frozenset': frozenset,
+            'dict': dict, 'range': range, 'type': type, 'object': object,
+            'abs': abs, 'min': min, 'max': max, 'sum': sum, 'round': round,
+            'pow': pow, 'divmod': divmod, 'len': len, 'enumerate': enumerate,
+            'zip': zip, 'map': map, 'filter': filter, 'sorted': sorted,
+            'reversed': reversed, 'iter': iter, 'next': next, 'any': any, 'all': all,
+            'repr': repr, 'ascii': ascii, 'chr': chr, 'ord': ord,
+            'hex': hex, 'oct': oct, 'bin': bin, 'format': format,
+            'hash': hash, 'id': id, 'getattr': getattr, 'setattr': setattr,
+            'hasattr': hasattr, 'isinstance': isinstance, 'issubclass': issubclass,
+            'True': True, 'False': False, 'None': None,
+            'Exception': Exception, 'ValueError': ValueError, 'TypeError': TypeError,
+            'KeyError': KeyError, 'IndexError': IndexError, 'AttributeError': AttributeError,
+            'RuntimeError': RuntimeError, 'StopIteration': StopIteration,
+            'ZeroDivisionError': ZeroDivisionError, 'ArithmeticError': ArithmeticError,
+            'LookupError': LookupError, 'NotImplementedError': NotImplementedError,
+            'print': lambda *a, **k: test_logger.info("custom_tool: %s", " ".join(str(x) for x in a)),
+        {chr(125)}
         code = {json.dumps(code)}
         args = json.loads({json.dumps(args_json)})
-        ns = {{"__name__": "baize_custom_tool"}}
+        ns = {{"__name__": "baize_custom_tool", "__builtins__": _SAFE_BUILTINS, "logger": test_logger}}
         try:
             exec(compile(code, "<custom_tool>", "exec"), ns)
             handler = ns.get("handler")
             if not callable(handler):
-                print("ERROR: 代码未定义可调用的 handler 函数", file=sys.stderr)
+                test_logger.error("代码未定义可调用的 handler 函数")
                 sys.exit(2)
             import inspect
             if inspect.iscoroutinefunction(handler):

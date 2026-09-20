@@ -56,6 +56,7 @@ class Session:
     container_id: Optional[str] = None
     container_bound_at: Optional[str] = None
     # active | archived（archived 表示已结束并归档到 ~/.baize/archives/）
+    # B-25: 新增 draft 状态——草稿会话不混入任务列表，需单独索引。
     status: str = "active"
     archived_at: Optional[str] = None
 
@@ -251,9 +252,35 @@ class SessionManager:
 
     def list_sessions(self) -> list[Session]:
         # 任务管理页只列出 active 任务；archived 已移到 ~/.baize/archives/
+        # B-25: draft 状态的草稿会话不混入 active 列表，需走 list_draft_sessions。
         with self._lock:
-            items = [s for s in self._sessions.values() if s.status == "active"]
+            items = [
+                s for s in self._sessions.values()
+                if s.status == "active"
+            ]
         return sorted(items, key=lambda s: s.updated_at, reverse=True)
+
+    def list_draft_sessions(self) -> list[Session]:
+        # B-25: 草稿会话单独索引，避免与 active 任务混在一起。
+        # 草稿通常表示用户尚未提交/启动的任务，前端在独立的"草稿"分页展示。
+        with self._lock:
+            items = [
+                s for s in self._sessions.values()
+                if s.status == "draft"
+            ]
+        return sorted(items, key=lambda s: s.updated_at, reverse=True)
+
+    def mark_session_status(self, session_id: str, status: str) -> bool:
+        # B-25: 在 active/draft 之间切换（archived 仍走 archive_session）。
+        # 用于前端把草稿提升为正式任务，或反向把未开始的 active 降为 draft。
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                return False
+            session.status = status
+            session.updated_at = _now()
+            self._save(session)
+            return True
 
     # ---- 任务-容器绑定 / 归档 / 恢复 -----------------------------------
     async def bind_container(

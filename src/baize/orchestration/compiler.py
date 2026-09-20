@@ -458,6 +458,18 @@ class PipelineGraphCompiler:
         state: PipelineState,
     ) -> dict[str, Any]:
         """执行节点并应用重试 / 失败分支策略。"""
+        # B-32: 缓存 —— 若节点已成功执行过（如 replay / resume 场景），
+        # 直接复用 state 中的已完成记录，避免重复执行副作用节点。
+        existing = (state.get("nodes") or {}).get(node.id) or {}
+        if (
+            existing.get("status") == "completed"
+            and (existing.get("output") or existing.get("data"))
+            and not getattr(node, "always_rerun", False)
+        ):
+            logger.info("节点 %s 命中缓存（已 completed），跳过执行", node.id)
+            # _err_route 留空：缓存命中视为成功，不走失败分支
+            return {"_err_route": "", "nodes": state.get("nodes", {})}
+
         attempts = max(1, int(node.max_retries or 1))
         updates: dict[str, Any] = {}
         for attempt in range(attempts):

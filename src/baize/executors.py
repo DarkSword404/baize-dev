@@ -184,6 +184,15 @@ class BaseExecutor:
         """并发批量执行多条命令。"""
         return list(await asyncio.gather(*[self.run(c, timeout=timeout, **kwargs) for c in commands]))
 
+    async def run_classified(self, command: str, **kwargs: Any) -> ExecResult:
+        """B-14: 模板方法 —— 自动按命令特征分级超时后执行。
+
+        比直接调 ``run()`` 更智能：快速命令不会因 120s 默认超时浪费资源，
+        长任务不会因 120s 默认超时被误杀。
+        """
+        timeout = classify_timeout(command)
+        return await self.run(command, timeout=timeout, **kwargs)
+
     def __repr__(self) -> str:  # pragma: no cover
         return f"<{self.__class__.__name__}>"
 
@@ -913,6 +922,59 @@ class ExecutorConfig:
         )
 
 
+# B-12: 容器运行时自动探测 —— 优先 docker，其次 podman
+_RUNTIME_CACHE: Optional[tuple[str, str]] = None  # (cmd, version)
+
+
+def detect_container_runtime() -> Optional[str]:
+    """探测可用的容器运行时（docker 或 podman）。
+
+    返回可执行的容器命令路径；不可用则返回 None。
+    结果缓存，避免反复 fork which。
+    """
+    global _RUNTIME_CACHE
+    if _RUNTIME_CACHE is not None:
+        return _RUNTIME_CACHE[0] if _RUNTIME_CACHE[0] else None
+    for cmd in ("docker", "podman"):
+        path = shutil.which(cmd)
+        if path:
+            try:
+                r = subprocess.run([path, "--version"], capture_output=True, text=True, timeout=5)
+                if r.returncode == 0:
+                    _RUNTIME_CACHE = (path, r.stdout.strip())
+                    return path
+            except Exception:  # noqa: BLE001
+                continue
+    _RUNTIME_CACHE = ("", "")
+    return None
+
+
+# B-13: 分级超时 —— 按命令特征自动选择合理的超时上限
+TIMEOUT_QUICK = 30     # 快速命令：whoami, id, ls
+TIMEOUT_NORMAL = 120   # 常规扫描：nmap -sV, nikto
+TIMEOUT_LONG = 600     # 长任务：hashcat, full port scan
+
+_QUICK_PREFIXES = (
+    "whoami", "id", "ls", "pwd", "cat ", "echo ", "uname",
+    "hostname", "ip addr", "ifconfig", "env", "date",
+)
+
+
+def classify_timeout(command: str, default: int = TIMEOUT_NORMAL) -> int:
+    """根据命令特征推断合理的超时级别。
+
+    快速命令（whoami/id/ls/cat）→ 30s
+    明确的长任务关键词（hashcat/john/hydra/ffuf/full scan）→ 600s
+    其余 → default（通常 120s）
+    """
+    cmd_lower = command.strip().lower()
+    if any(cmd_lower.startswith(p) for p in _QUICK_PREFIXES):
+        return TIMEOUT_QUICK
+    if any(kw in cmd_lower for kw in ("hashcat", "john", "hydra", "ffuf", "gobuster", "nucleus", "-p-")):
+        return TIMEOUT_LONG
+    return default
+
+
 def _session_has_container(session_id: str) -> bool:
     """检查任务是否已绑定容器（查 ContainerRegistry）。
 
@@ -974,8 +1036,14 @@ def build_executor(config: Optional[ExecutorConfig] = None, **kwargs: Any) -> Ba
         return SessionContainerExecutor(session_id=session_id)
 
     if backend == "docker":
+        # B-12: 自动探测容器运行时（docker/podman），不可用时降级到 local
+        runtime = detect_container_runtime()
+        if runtime is None:
+            logger.warning("docker 后端已配置但未检测到容器运行时，降级到 local 执行器")
+            return LocalExecutor(**kwargs)
         return DockerExecutor(
             image=kwargs.pop("image", config.image),
+            docker_cmd=kwargs.pop("docker_cmd", runtime),
             **kwargs,
         )
     if backend == "ssh":

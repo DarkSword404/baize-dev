@@ -25,6 +25,31 @@ const intermediateConfig: Record<string, { icon: string; border: string; bg: str
   handoff:              { icon: '↗️', border: 'border-amber-500/20',  bg: 'bg-amber-600/5' },
 };
 
+/** F-03: 判断中间产物是否为失败的工具调用（错误/拒绝/超时），用于切换红色错误图标 */
+function isErrorIntermediate(item: IntermediateData): boolean {
+  const label = (item.label || '').trim();
+  if (label.startsWith('错误') || label.startsWith('失败')) return true;
+  if (/^\[?(失败|超时|异常|拒绝|denied)\]?/i.test(label)) return true;
+  return /\b(failed|error|timeout|denied)\b/i.test(item.detail || '');
+}
+
+/**
+ * F-16: 在已渲染的 HTML 上做防御性清洗。
+ * 渲染器本身已先 escape 输入再构造标签，这里作为纵深防御：
+ * 剥离 <script>/<style>/<iframe> 等危险标签、移除 on* 事件属性、阻断 javascript: 协议。
+ */
+function sanitizeHtml(html: string): string {
+  return html
+    // 移除成对的 script/style/iframe/object/embed 标签（含内容）
+    .replace(/<\s*(script|style|iframe|object|embed)[\s\S]*?<\/\s*\1\s*>/gi, '')
+    // 移除未闭合或自闭合的危险标签
+    .replace(/<\s*(script|style|iframe|object|embed|link|meta)[^>]*>/gi, '')
+    // 移除 on* 事件属性（onerror=、onclick= 等）
+    .replace(/\son\w+\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)/gi, '')
+    // 阻断 javascript:/vbscript: 协议的 href/src
+    .replace(/(href|src)\s*=\s*("|')\s*(javascript|vbscript):[^"']*\2/gi, '$1="#"');
+}
+
 export function ChatMessage({ msg }: { msg: ChatMessageType }): JSX.Element {
   const hasIntermediates = msg.intermediates && msg.intermediates.length > 0;
   const isUser = msg.role === 'user';
@@ -122,6 +147,12 @@ function attachmentIcon(filename: string): string {
 function ThinkingBlock({ item, timestamp, isLast }: { item: IntermediateData; timestamp: string; isLast: boolean }): JSX.Element {
   const [expanded, setExpanded] = useState(true); // expanded by default
   const ico = intermediateConfig[item.itemType] || intermediateConfig.handoff;
+  // F-03: 失败的工具调用切换为红色错误图标与红色边框
+  const isError = isErrorIntermediate(item);
+  const displayIcon = isError ? '⚠' : ico.icon;
+  const containerBorder = isError ? 'border-red-500/30' : ico.border;
+  const containerBg = isError ? 'bg-red-600/5' : ico.bg;
+  const iconColor = isError ? 'text-red-400' : '';
 
   // Collapse when streaming ends (isLast transitions from true to false)
   const wasLast = useRef(isLast);
@@ -137,17 +168,20 @@ function ThinkingBlock({ item, timestamp, isLast }: { item: IntermediateData; ti
     <div className="ml-2 group">
       <button
         onClick={() => setExpanded(!expanded)}
-        className={`w-full text-left flex items-center gap-2 px-3 py-1.5 rounded-lg border ${ico.border} ${ico.bg} hover:bg-gray-700/30 transition-colors cursor-pointer ${
+        aria-label={isError ? '失败的步骤，点击展开详情' : '步骤详情，点击展开'}
+        aria-expanded={expanded}
+        className={`w-full text-left flex items-center gap-2 px-3 py-1.5 rounded-lg border ${containerBorder} ${containerBg} hover:bg-gray-700/30 transition-colors cursor-pointer ${
           isLast ? 'animate-pulse border-opacity-60' : ''
         }`}
       >
         <span
           className="text-[10px] text-gray-500 flex-shrink-0 transition-transform duration-200"
           style={{ transform: expanded ? 'rotate(90deg)' : '' }}
+          aria-hidden="true"
         >
           ▶
         </span>
-        <span className="text-xs flex-shrink-0">{ico.icon}</span>
+        <span className={`text-xs flex-shrink-0 ${iconColor}`} aria-hidden="true">{displayIcon}</span>
         <span className="text-xs text-gray-300 font-mono truncate flex-1">
           {item.label}
         </span>
@@ -199,7 +233,8 @@ function renderThinkingDetail(text: string): string {
       out.push(`<span class="text-gray-300">${line}</span>`);
     }
   }
-  return out.join('<br/>');
+  // F-16: 思考详情也做防御性清洗
+  return sanitizeHtml(out.join('<br/>'));
 }
 
 function renderMarkdown(text: string): string {
@@ -212,10 +247,13 @@ function renderMarkdown(text: string): string {
     .replace(/'/g, '&#39;');
 
   // Code blocks: ```...```（先提取，避免内部被其他规则误伤）
+  // F-05: 提取语言标签并显示在代码块顶部，便于识别代码类型
   const codeBlocks: string[] = [];
-  html = html.replace(/```(\w*)\n([\s\S]*?)```/g, (_m, _lang, code) => {
+  html = html.replace(/```(\w*)\n([\s\S]*?)```/g, (_m, lang, code) => {
     const placeholder = `\x00CODEBLOCK${codeBlocks.length}\x00`;
-    codeBlocks.push(`<pre class="code-block">${code.trim()}</pre>`);
+    const safeLang = (lang || '').replace(/[^a-zA-Z0-9_+-]/g, '');
+    const langTag = safeLang ? `<span class="code-lang">${safeLang}</span>` : '';
+    codeBlocks.push(`<pre class="code-block" data-lang="${safeLang}">${langTag}<code>${code.trim()}</code></pre>`);
     return placeholder;
   });
 
@@ -340,5 +378,6 @@ function renderMarkdown(text: string): string {
     html = html.replace(`\x00CODEBLOCK${i}\x00`, block);
   });
 
-  return html;
+  // F-16: 输出前做防御性清洗，阻断可能的注入
+  return sanitizeHtml(html);
 }

@@ -115,24 +115,74 @@ def register(app: FastAPI) -> None:
 
     @app.get("/api/v1/reports/{report_id}/download",
              dependencies=[Depends(_require_api_key)])
-    def download_report(report_id: str) -> Response:
+    def download_report(report_id: str, fmt: str = Query("md", description="导出格式: md | html")) -> Response:
         rec = store.get(report_id)
         if rec is None:
             raise HTTPException(status_code=404, detail="报告不存在")
         content = store.get_content(report_id) or ""
         # 文件名安全化（中文走 RFC 5987 编码）
         safe_title = rec.title.replace("/", "_").replace("\\", "_")[:100]
-        filename = f"{safe_title or report_id}.md"
+
+        if fmt == "html":
+            # B-44: 导出为可打印 HTML（浏览器 Ctrl+P 可另存为 PDF）
+            import html as html_mod
+            html_doc = (
+                "<!DOCTYPE html>\n<html lang=\"zh-CN\">\n<head>\n"
+                "<meta charset=\"utf-8\">\n"
+                f"<title>{html_mod.escape(rec.title)}</title>\n"
+                "<style>\n"
+                "body{font-family:'Noto Sans SC','Microsoft YaHei',sans-serif;"
+                "max-width:800px;margin:2em auto;padding:0 1em;line-height:1.6;}"
+                "h1{border-bottom:2px solid #333;}"
+                "h2{border-bottom:1px solid #999;margin-top:1.5em;}"
+                "pre{background:#f5f5f5;padding:1em;overflow-x:auto;border-radius:4px;}"
+                "code{font-family:'Fira Code',monospace;}"
+                "table{border-collapse:collapse;width:100%;}"
+                "th,td{border:1px solid #ddd;padding:8px;}"
+                "@media print{body{margin:0;max-width:none;}}"
+                "</style>\n</head>\n<body>\n"
+                f"<h1>{html_mod.escape(rec.title)}</h1>\n"
+            )
+            # 简易 Markdown → HTML 转换（标题/代码块/段落）
+            lines = content.split("\n")
+            in_code = False
+            for line in lines:
+                if line.strip().startswith("```"):
+                    if in_code:
+                        html_doc += "</pre>\n"
+                        in_code = False
+                    else:
+                        html_doc += "<pre>"
+                        in_code = True
+                    continue
+                if in_code:
+                    html_doc += html_mod.escape(line) + "\n"
+                elif line.startswith("# "):
+                    html_doc += f"<h2>{html_mod.escape(line[2:])}</h2>\n"
+                elif line.startswith("## "):
+                    html_doc += f"<h3>{html_mod.escape(line[3:])}</h3>\n"
+                elif line.startswith("- ") or line.startswith("* "):
+                    html_doc += f"<li>{html_mod.escape(line[2:])}</li>\n"
+                elif line.strip():
+                    html_doc += f"<p>{html_mod.escape(line)}</p>\n"
+            if in_code:
+                html_doc += "</pre>\n"
+            html_doc += "</body></html>"
+            ext = "html"
+            media = "text/html; charset=utf-8"
+            body = html_doc.encode("utf-8")
+        else:
+            ext = "md"
+            media = "text/markdown; charset=utf-8"
+            body = content.encode("utf-8")
+
+        filename = f"{safe_title or report_id}.{ext}"
         encoded = urllib.parse.quote(filename)
         headers = {
             "Content-Disposition":
                 f"attachment; filename*=UTF-8''{encoded}",
         }
-        return Response(
-            content=content.encode("utf-8"),
-            media_type="text/markdown; charset=utf-8",
-            headers=headers,
-        )
+        return Response(content=body, media_type=media, headers=headers)
 
     @app.delete("/api/v1/reports/{report_id}",
                 dependencies=[Depends(_require_api_key)])

@@ -263,6 +263,68 @@ model_registry.register("openai-compatible", OpenAICompatibleModel, "OpenAI 兼�
 
 
 # ===========================================================================
+#  B-54: provider 映射 —— 按模型名 / base_url 推断 provider
+# ===========================================================================
+
+# 已知模型名前缀 → provider 映射（按字符串前缀匹配，靠前的优先级更高）
+# 注：当前实现仅 OpenAICompatibleModel 一个适配器，所有 provider 最终都走
+# OpenAI 兼容端点；此映射用于审计日志、错误归因、未来按 provider 切换实现。
+_MODEL_PREFIX_TO_PROVIDER: list[tuple[str, str]] = [
+    ("claude", "anthropic"),
+    ("anthropic", "anthropic"),
+    ("gpt", "openai"),
+    ("o1", "openai"),
+    ("o3", "openai"),
+    ("text-embedding", "openai"),
+    ("deepseek", "openai"),       # deepseek 走 OpenAI 兼容端点
+    ("qwen", "openai"),           # 通义千问走 DashScope OpenAI 兼容
+    ("glm", "openai"),            # 智谱 GLM 走 OpenAI 兼容端点
+    ("llama", "local"),
+    ("mistral", "openai"),
+    ("qwen2", "local"),
+    ("yi", "openai"),
+    ("baize", "local"),
+]
+
+
+def resolve_provider(
+    model: Optional[str] = None,
+    base_url: Optional[str] = None,
+    *,
+    explicit: Optional[str] = None,
+) -> str:
+    """B-54: provider 映射 —— 把模型名/base_url 推断为 provider 字符串。
+
+    返回值取值: ``openai`` / ``anthropic`` / ``local`` / ``openai-compatible``（兜底）。
+
+    优先级:
+    1. 显式指定的 ``explicit``（如配置文件中的 provider 字段，未来扩展用）
+    2. base_url 主机名命中本地特征（localhost/127.0.0.1/内网/ollama 端口）
+    3. 模型名前缀匹配 _MODEL_PREFIX_TO_PROVIDER
+    4. 默认 ``openai-compatible``
+    """
+    if explicit:
+        return explicit
+    # 2. base_url 特征：本地部署（ollama/vllm/llama.cpp）走本地
+    if base_url:
+        host = base_url.lower()
+        if any(s in host for s in ("localhost", "127.0.0.1", "0.0.0.0", "::1")):
+            return "local"
+        if ":11434" in host:  # ollama 默认端口
+            return "local"
+        if any(s in host for s in ("anthropic.com",)):
+            return "anthropic"
+    # 3. 模型名前缀匹配
+    if model:
+        low = model.lower()
+        for prefix, provider in _MODEL_PREFIX_TO_PROVIDER:
+            if low.startswith(prefix):
+                return provider
+    # 4. 兜底
+    return "openai-compatible"
+
+
+# ===========================================================================
 #  ModelRouter — 多模型路由 + Fallback
 # ===========================================================================
 
@@ -367,4 +429,5 @@ __all__ = [
     "ModelRegistry",
     "model_registry",
     "ModelRouter",
+    "resolve_provider",
 ]

@@ -30,6 +30,11 @@ logger = logging.getLogger(__name__)
 # 故全局兜底默认需高于单实例上限，避免成为瓶颈；可用环境变量 BAIZE_PIPELINE_MAX_CONCURRENT 覆盖。
 DEFAULT_MAX_CONCURRENT = max(1, int(os.environ.get("BAIZE_PIPELINE_MAX_CONCURRENT", "20")))
 
+# B-31: webhook 重试 —— 失败时按指数退避重试，最多 3 次（覆盖约 7 秒抖动窗口）。
+# 退避序列：1s -> 2s -> 4s，与 _LLM_RETRY_BACKOFF_BASE 语义一致。
+WEBHOOK_MAX_RETRIES = 3
+WEBHOOK_BACKOFF_BASE = 1.0
+
 
 class PipelineRunner:
     """后台流水线执行引擎。
@@ -206,12 +211,43 @@ class PipelineRunner:
             self._store.update_status(run_id, "failed", "管道定义未找到")
             return self._store.get(run_id)
 
+        # B-34: 恢复校验 —— 在继续执行前校验先前步骤的输出仍存在
+        # （服务重启或外部清理可能导致持久化数据丢失，盲目续跑会得到不完整结果）
+        missing = self._validate_prior_outputs(pipeline_def, record)
+        if missing:
+            err = f"恢复校验失败：先前的步骤输出缺失 ({', '.join(missing)})"
+            self._store.update_status(run_id, "failed", err)
+            return self._store.get(run_id)
+
         # 恢复执行（在后台任务中）
         self._store.update_status(run_id, "running")
         asyncio.create_task(
             self._execute_resume(pipeline_def, run_id, choice)
         )
         return record
+
+    def _validate_prior_outputs(
+        self,
+        pipeline: PipelineDefinition,
+        record: RunRecord,
+    ) -> list[str]:
+        """B-34: 校验恢复前已成功完成的节点输出是否仍然存在。
+
+        检查 record.nodes 中标记为 completed 的节点是否仍带有 output/data 字段；
+        若缺失（如持久化数据被清理 / 旧版本兼容问题），返回缺失节点 id 列表。
+        """
+        missing: list[str] = []
+        for node in pipeline.nodes:
+            rec = record.nodes.get(node.id) or {}
+            if rec.get("status") != "completed":
+                continue  # 只校验已完成的节点
+            if not (rec.get("output") or rec.get("data")):
+                missing.append(node.id)
+                logger.warning(
+                    "run %s 恢复校验：节点 %s 标记为 completed 但 output/data 缺失",
+                    record.run_id, node.id,
+                )
+        return missing
 
     # ------------------------------------------------------------------
     # Public — 服务重启恢复
@@ -466,16 +502,43 @@ class PipelineRunner:
         status: str,
         error: str = "",
     ) -> None:
-        try:
-            import httpx
-            async with httpx.AsyncClient(timeout=10) as client:
-                await client.post(url, json={
-                    "run_id": run_id,
-                    "status": status,
-                    "error": error,
-                })
-        except Exception as e:
-            logger.warning(f"Webhook 发送失败: {e}")
+        # B-31: webhook 重试 —— 临时性故障（连接超时/5xx/网络抖动）按指数退避重试
+        # 最多 WEBHOOK_MAX_RETRIES 次；非临时性故障（4xx）不重试，避免无效请求。
+        import httpx
+        last_exc: Exception | None = None
+        for attempt in range(WEBHOOK_MAX_RETRIES + 1):
+            try:
+                async with httpx.AsyncClient(timeout=10) as client:
+                    resp = await client.post(url, json={
+                        "run_id": run_id,
+                        "status": status,
+                        "error": error,
+                    })
+                    # 2xx 视为成功；4xx（客户端错误，如 URL 失效/鉴权失败）不重试
+                    if 200 <= resp.status_code < 300:
+                        return
+                    if 400 <= resp.status_code < 500:
+                        logger.warning(
+                            f"Webhook 回调 {url} 返回 {resp.status_code}（客户端错误，不重试）"
+                        )
+                        return
+                    # 5xx 视为服务端临时故障，可重试
+                    last_exc = httpx.HTTPStatusError(
+                        f"webhook 返回 {resp.status_code}", request=resp.request, response=resp
+                    )
+            except Exception as e:
+                last_exc = e
+            if attempt < WEBHOOK_MAX_RETRIES:
+                delay = WEBHOOK_BACKOFF_BASE * (2 ** attempt)
+                logger.warning(
+                    f"Webhook 发送失败（第 {attempt + 1}/{WEBHOOK_MAX_RETRIES} 次），"
+                    f"{delay:.1f}s 后重试: {last_exc}"
+                )
+                await asyncio.sleep(delay)
+        if last_exc is not None:
+            logger.warning(
+                f"Webhook 发送最终失败（重试 {WEBHOOK_MAX_RETRIES} 次后放弃）: {last_exc}"
+            )
 
 
 # ====================================================================

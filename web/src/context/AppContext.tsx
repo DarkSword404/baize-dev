@@ -124,6 +124,39 @@ export function AppProvider({ children }: { children: ReactNode }) {
   useEffect(() => { persistState('baize-sessions', sessions); }, [sessions]);
   useEffect(() => { persistState('baize-active-session', activeSessionId); }, [activeSessionId]);
 
+  // F-10: 跨 tab 同步会话列表——BroadcastChannel 广播 / 接收
+  // 一处归档/新建会话，其他 tab 自动刷新会话列表，避免数据错位
+  const syncChannelRef = useRef<BroadcastChannel | null>(null);
+  // 标记本次 state 变更是由其他 tab 广播触发的，避免再回环广播
+  const fromBroadcastRef = useRef(false);
+
+  useEffect(() => {
+    if (typeof BroadcastChannel === 'undefined') return; // 旧浏览器无此 API
+    const ch = new BroadcastChannel('baize-session-sync');
+    syncChannelRef.current = ch;
+    ch.onmessage = (ev) => {
+      const msg = ev.data;
+      if (!msg || typeof msg !== 'object') return;
+      if (msg.type === 'sessions' && Array.isArray(msg.sessions)) {
+        fromBroadcastRef.current = true;
+        setSessionsState(msg.sessions as SessionInfo[]);
+      }
+    };
+    return () => {
+      ch.close();
+      syncChannelRef.current = null;
+    };
+  }, []);
+
+  // sessions 变更时广播给其他 tab（来自广播的变更不回环）
+  useEffect(() => {
+    if (fromBroadcastRef.current) {
+      fromBroadcastRef.current = false;
+      return;
+    }
+    syncChannelRef.current?.postMessage({ type: 'sessions', sessions });
+  }, [sessions]);
+
   const addSession = useCallback((s: SessionInfo) => {
     setSessionsState(prev => [s, ...prev.filter(x => x.id !== s.id)]);
   }, []);

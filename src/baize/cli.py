@@ -196,6 +196,29 @@ def cmd_serve(argv: list[str]) -> int:
     return 0
 
 
+def cmd_backup(argv: list[str]) -> int:
+    """X-12: 备份会话/报告/配置到 tar.gz。"""
+    parser = argparse.ArgumentParser(prog="baize backup", description="备份白泽数据")
+    parser.add_argument("-o", "--output", default="baize-backup.tar.gz",
+                        help="输出文件路径（默认 baize-backup.tar.gz）")
+    parser.add_argument("--data-dir", default=None, help="数据目录（默认 ~/.baize）")
+    args = parser.parse_args(argv)
+
+    import tarfile
+    from pathlib import Path
+
+    data_dir = Path(args.data_dir or os.path.expanduser("~/.baize"))
+    if not data_dir.exists():
+        print(_fail(f"数据目录不存在: {data_dir}"))
+        return 1
+
+    output = Path(args.output)
+    with tarfile.open(output, "w:gz") as tar:
+        tar.add(data_dir, arcname="baize-data", filter=lambda f: None if f.name.endswith(".lock") else f)
+    print(_ok(f"备份完成: {output}（{output.stat().st_size // 1024}KB）"))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     """Baize 命令行入口。"""
     parser = argparse.ArgumentParser(prog="baize", description="白泽·智脑 (Baize) 命令行")
@@ -203,10 +226,13 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="command")
     sub.add_parser("serve", help="启动 Web API 服务（默认）")
     sub.add_parser("doctor", help="环境自检：系统工具/模型/向量/浏览器依赖")
+    sub.add_parser("backup", help="备份会话/报告/配置数据")
     args, rest = parser.parse_known_args(argv)
 
     if args.command == "doctor":
         return cmd_doctor(rest)
+    if args.command == "backup":
+        return cmd_backup(rest)
     return cmd_serve(rest)
 
 

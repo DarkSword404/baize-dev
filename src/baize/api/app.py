@@ -34,6 +34,11 @@ from baize.api.attachments import (
     AttachmentStore,
     attachment_tools,
     detect_file_type,
+    is_allowed,
+    IMAGE_MIME,
+    _safe_join,
+    max_upload_bytes,
+    Attachment,
 )
 from baize.api.auth import AuthManager
 from baize.api.custom_agents import CustomAgentStore, CustomPipelineStore, get_deleted_store
@@ -541,7 +546,14 @@ async def _with_sse_heartbeat(agen, interval: float = 15.0):
             )
             if next_task in done:
                 if sleep_task is not None and not sleep_task.done():
+                    # B-30: 心跳 await — cancel 后需 await 让取消传播，
+                    # 否则旧 sleep 任务残留为"待取消"状态，下一次循环可能
+                    # 触发 "Task was destroyed but it is pending" 警告。
                     sleep_task.cancel()
+                    try:
+                        await sleep_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
                 sleep_task = None
                 try:
                     item = next_task.result()
@@ -553,9 +565,15 @@ async def _with_sse_heartbeat(agen, interval: float = 15.0):
                 yield "heartbeat", None
                 sleep_task = None
     finally:
+        # B-30: 心跳 await — 清理时尚在运行的 task 必须 await 取消，
+        # 不能 fire-and-forget（仅 cancel 不 await 会让任务悬空）。
         for t in (next_task, sleep_task):
             if t is not None and not t.done():
                 t.cancel()
+                try:
+                    await t
+                except (asyncio.CancelledError, Exception):
+                    pass
         try:
             await agen.aclose()
         except Exception:  # noqa: BLE001
@@ -568,6 +586,15 @@ async def _with_sse_heartbeat(agen, interval: float = 15.0):
 # 避免多个编排器/agent 重叠运行：抢共享浏览器锁、重复扫描目标、疯狂烧 token。
 # ----------------------------------------------------------------------
 _active_session_tasks: dict[str, "asyncio.Task"] = {}
+
+
+# ----------------------------------------------------------------------
+# B-15: SSE 单飞（single-flight pipeline）注册表
+# 同会话的多个 SSE 客户端复用同一活跃流：首个连接成为 leader 跑流水线，
+# 后续连接作为 follower 从 leader 的广播队列读取事件，避免重复启动流水线。
+# 结构：session_id -> (leader_task, [subscriber_queue, ...])
+# ----------------------------------------------------------------------
+_session_sse_leaders: dict[str, tuple["asyncio.Task", list["asyncio.Queue"]]] = {}
 
 
 # ----------------------------------------------------------------------
@@ -619,6 +646,13 @@ def create_baize_api_app(
     *,
     session_manager: SessionManager | None = None,
 ) -> FastAPI:
+    # B-21: 结构化日志 + 文件轮转（幂等，不会重复配置）
+    try:
+        from baize.logging_config import setup_logging
+        setup_logging()
+    except Exception:  # noqa: BLE001
+        pass  # fallback 到下面的 basicConfig
+
     # 配置 application logger：uvicorn 直接启动时不经过 cli.py，
     # 需在此显式配置，否则 baize.orchestration 节点的日志不可见。
     import sys as _sys
@@ -633,6 +667,12 @@ def create_baize_api_app(
 
     cfg = get_server_config()
     app = FastAPI(title="Baize API", version=__version__)
+
+    # X-01: 限流中间件（默认 60 次/分钟，可通过 BAIZE_RATE_LIMIT 环境变量调整）
+    import os as _os
+    from baize.api.rate_limit import RateLimitMiddleware
+    _rate_limit = int(_os.environ.get("BAIZE_RATE_LIMIT", "60"))
+    app.add_middleware(RateLimitMiddleware, max_requests=_rate_limit)
 
     # CORS（允许前端开发服务器）
     # 注意：前端使用 X-Baize-API-Key 请求头认证（非 Cookie），
@@ -672,9 +712,17 @@ def create_baize_api_app(
 
     # ── 任务-容器解耦：容器注册表 + 任务归档管理 ──
     from baize.pentest.container_registry import ContainerRegistry
-    from baize.api.archives import ArchiveManager
+    from baize.api.archives import ArchiveManager, get_archive_retention_days
     app.state.container_registry = ContainerRegistry()
     app.state.archive_manager = ArchiveManager()
+    # B-28: 归档清理 - 启动时按保留期自动清理过期归档，避免 ~/.baize/archives/ 无限膨胀
+    try:
+        _retention = get_archive_retention_days()
+        _removed = app.state.archive_manager.cleanup_old_archives(_retention)
+        if _removed:
+            logger.info("B-28 启动归档清理：删除 %d 个超过 %d 天的归档", _removed, _retention)
+    except Exception:  # noqa: BLE001
+        logger.warning("B-28 启动归档清理失败", exc_info=True)
     # 启动时对账：扫描运行中 baize-sandbox-* 容器，重建注册表（孤儿/停止状态）
     try:
         from baize.pentest.workspace import get_container_manager
@@ -816,6 +864,15 @@ def create_baize_api_app(
             version=__version__,
             checks=checks,
         )
+
+    # B-20: Prometheus 指标端点
+    @app.get("/metrics")
+    def metrics() -> str:
+        """Prometheus exposition 格式指标。"""
+        from baize.api.metrics import render_metrics, set_gauge
+        # 设置运行时 gauge
+        set_gauge("baize_sessions_total", len(app.state.session_manager.list_sessions()))
+        return render_metrics()
 
     # ------------------------------------------------------------------
     # 已安装模块列表
@@ -1261,6 +1318,16 @@ def create_baize_api_app(
     )
     def list_sessions() -> ListSessionsResponse:
         sessions = app.state.session_manager.list_sessions()
+        return ListSessionsResponse(sessions=[s.to_dict() for s in sessions])
+
+    @app.get(
+        "/api/v1/sessions/drafts",
+        response_model=ListSessionsResponse,
+        dependencies=[Depends(_require_api_key)],
+    )
+    def list_draft_sessions() -> ListSessionsResponse:
+        # B-25: 草稿会话单独索引，避免与 active 任务混在一起。
+        sessions = app.state.session_manager.list_draft_sessions()
         return ListSessionsResponse(sessions=[s.to_dict() for s in sessions])
 
     @app.get(
@@ -1868,13 +1935,78 @@ def create_baize_api_app(
         session = app.state.session_manager.get_session(session_id)
         if session is None:
             raise HTTPException(status_code=404, detail="会话不存在")
-        data = await file.read()
+        # B-19: 流式上传 - 大文件分块写入磁盘，避免全量载入内存导致 OOM。
+        # 旧版 `data = await file.read()` 一次性把整个文件读入内存，
+        # 上传百兆文件会让内存暴涨；这里改为 64KB 分块流式落盘。
+        store = app.state.attachment_store
+        filename = file.filename or "unnamed"
+        if not is_allowed(filename):
+            raise HTTPException(status_code=400, detail=f"不支持的文件类型: {filename}")
+        # 路径穿越防护：仅保留 basename，拒绝目录成分
+        safe_name = Path(filename.replace("\\", "/")).name.strip()
+        if not safe_name or safe_name in (".", ".."):
+            raise HTTPException(status_code=400, detail=f"非法文件名: {filename}")
+
+        import secrets as _secrets
+        file_id = _secrets.token_hex(8)
+        fdir = store._file_dir(session_id, file_id)
+        fdir.mkdir(parents=True, exist_ok=True)
+        orig_dir = fdir / "original"
+        orig = _safe_join(orig_dir, safe_name)
+        if orig is None:
+            raise HTTPException(status_code=400, detail=f"非法文件名: {filename}")
+        orig.parent.mkdir(parents=True, exist_ok=True)
+
+        size = 0
+        max_size = max_upload_bytes()
         try:
-            att = app.state.attachment_store.save_attachment(
-                session_id, file.filename or "unnamed", data
-            )
-        except ValueError as e:
-            raise HTTPException(status_code=400, detail=str(e))
+            with open(orig, "wb") as out:
+                while True:
+                    chunk = await file.read(1 << 16)  # 64KB 分块
+                    if not chunk:
+                        break
+                    size += len(chunk)
+                    # 超限立即中止，避免无谓读完整个大文件
+                    if size > max_size:
+                        out.close()
+                        try:
+                            orig.unlink()
+                        except OSError:
+                            pass
+                        raise HTTPException(
+                            status_code=400,
+                            detail=(
+                                f"附件超过大小限制（{max_size // 1024 // 1024}MB，"
+                                f"可通过环境变量 BAIZE_MAX_UPLOAD_MB 调大）"
+                            ),
+                        )
+                    out.write(chunk)
+        except HTTPException:
+            raise
+        except Exception as e:  # noqa: BLE001
+            # 写盘失败：清理半成品
+            try:
+                orig.unlink()
+            except OSError:
+                pass
+            raise HTTPException(status_code=500, detail=f"上传失败: {e}")
+        finally:
+            await file.close()
+
+        file_type = detect_file_type(filename)
+        mime = IMAGE_MIME.get(Path(filename.lower()).suffix, "")
+        att = Attachment(
+            file_id=file_id,
+            filename=filename,
+            file_type=file_type,
+            mime=mime,
+            size=size,
+            path=str(orig),
+        )
+        # 登记索引（复用 AttachmentStore 的索引读写，保证与 list/get 一致）
+        index = store._load_index(session_id)
+        index[file_id] = att.to_dict()
+        store._save_index(session_id, index)
         return {"attachment": att.to_dict(), "ok": True}
 
     @app.get(
@@ -2031,6 +2163,14 @@ def create_baize_api_app(
 
         async def event_source():
             sm = app.state.session_manager
+            # B-26: 截断提示 - 工具输出超 max_message_chars 时给用户可见提示。
+            # 取当前模型配置的 max_message_chars（None 表示使用 LLM 侧默认 80000），
+            # 在 tool_result 走 SSE 时若超长则在 output 末尾追加可见提示。
+            try:
+                _mmc_cfg = app.state.model_config.load()
+                _mmc = (_mmc_cfg.max_message_chars if _mmc_cfg else None) or 80000
+            except Exception:  # noqa: BLE001
+                _mmc = 80000
             # 本轮累积缓冲：思考过程、工具调用/结果记录、最终文本
             reasoning_parts: list[str] = []
             tool_events: list[dict] = []
@@ -2416,6 +2556,14 @@ def create_baize_api_app(
                             f"data: {json.dumps({'type': 'tool_call', 'tool': event.tool_name, 'arguments': event.tool_args})}\n\n"
                         )
                     elif event.type == "tool_result":
+                        # B-26: 截断提示 - 工具输出超长时给用户可见提示。
+                        # LLM 侧会按 max_message_chars 截断（保留头尾），
+                        # 此处只在 SSE 输出末尾追加可见提示，不修改原 output
+                        # 完整内容仍写入会话日志供后续查阅。
+                        _trunc_notice = ""
+                        _raw_output = event.tool_result or ""
+                        if _mmc and len(_raw_output) > _mmc:
+                            _trunc_notice = "\n[输出已截断，完整内容见会话日志]"
                         tool_events.append(
                             {
                                 "type": "function_call_output",
@@ -2426,7 +2574,7 @@ def create_baize_api_app(
                         )
                         yield (
                             f"event: reasoning_step\n"
-                            f"data: {json.dumps({'type': 'tool_output', 'tool': event.tool_name, 'output': event.tool_result})}\n\n"
+                            f"data: {json.dumps({'type': 'tool_output', 'tool': event.tool_name, 'output': _raw_output + _trunc_notice})}\n\n"
                         )
                     elif event.type == "sandbox_approval":
                         # 沙箱审批：转发为 user_prompt 事件，前端展示审批弹窗
@@ -2496,7 +2644,12 @@ def create_baize_api_app(
                     )
                     if next_task in done:
                         if sleep_task is not None and not sleep_task.done():
+                            # B-30: 心跳 await — 取消后需 await 让取消传播
                             sleep_task.cancel()
+                            try:
+                                await sleep_task
+                            except (asyncio.CancelledError, Exception):
+                                pass
                         sleep_task = None
                         try:
                             item = next_task.result()
@@ -2526,16 +2679,88 @@ def create_baize_api_app(
                         yield 'event: ping\ndata: {"type":"ping"}\n\n'
                         sleep_task = None
             finally:
+                # B-30: 心跳 await — 清理时尚在运行的 task 必须 await 取消
                 for t in (next_task, sleep_task):
                     if t is not None and not t.done():
                         t.cancel()
+                        try:
+                            await t
+                        except (asyncio.CancelledError, Exception):
+                            pass
                 try:
                     await agen.aclose()
                 except Exception:  # noqa: BLE001
                     pass
 
+        async def _single_flight_event_source():
+            """B-15: SSE 单飞包装器。
+
+            同会话多个 SSE 客户端复用同一活跃流：首个连接成为 leader，
+            启动流水线并向所有 follower 广播事件；后续连接作为 follower
+            从队列读取 leader 广播的事件，避免重复启动流水线（重复烧 token、
+            抢共享浏览器锁、扫描目标等）。
+
+            follower 退出（断连/leader 结束）后会从订阅列表移除；leader
+            退出时通过 None 哨兵通知所有 follower 终止。
+            """
+            my_queue: "asyncio.Queue" = asyncio.Queue()
+            leader = _session_sse_leaders.get(session_id)
+            # Follower 路径：附加到已存在的活跃流
+            if leader is not None:
+                leader_task, subs = leader
+                if not leader_task.done():
+                    subs.append(my_queue)
+                    try:
+                        while True:
+                            if await request.is_disconnected():
+                                break
+                            # 队列拉取带 1s 超时：空闲时仍发心跳维持 SSE 连接
+                            try:
+                                item = await asyncio.wait_for(
+                                    my_queue.get(), timeout=1.0
+                                )
+                            except asyncio.TimeoutError:
+                                yield 'event: ping\ndata: {"type":"ping"}\n\n'
+                                continue
+                            if item is None:
+                                # leader 结束哨兵
+                                break
+                            yield item
+                    finally:
+                        if my_queue in subs:
+                            subs.remove(my_queue)
+                    return
+
+            # Leader 路径：运行真正的 event_source_with_heartbeat，
+            # 同时把每个产出的事件广播到所有 follower 队列
+            my_subs: list[asyncio.Queue] = [my_queue]
+            leader_task = asyncio.current_task()
+            _session_sse_leaders[session_id] = (leader_task, my_subs)  # type: ignore[assignment]
+            try:
+                async for chunk in _event_source_with_heartbeat():
+                    yield chunk
+                    # 广播到所有 follower（leader 自己直接 yield 给客户端）
+                    for q in list(my_subs):
+                        if q is my_queue:
+                            continue
+                        try:
+                            q.put_nowait(chunk)
+                        except asyncio.QueueFull:
+                            # follower 队列满：跳过本条，避免 leader 阻塞
+                            pass
+            finally:
+                _session_sse_leaders.pop(session_id, None)
+                # 通知所有 follower 退出（None 哨兵）
+                for q in list(my_subs):
+                    if q is my_queue:
+                        continue
+                    try:
+                        q.put_nowait(None)
+                    except asyncio.QueueFull:
+                        pass
+
         return StreamingResponse(
-            _event_source_with_heartbeat(),
+            _single_flight_event_source(),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache, no-transform",

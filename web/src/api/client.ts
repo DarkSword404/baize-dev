@@ -323,8 +323,9 @@ export async function clearModelConfig(): Promise<{ ok: boolean; configured: boo
 }
 
 // ===== Sessions =====
-export async function listSessions(): Promise<SessionsResponse> {
-  return request('/sessions');
+export async function listSessions(signal?: AbortSignal): Promise<SessionsResponse> {
+  // F-09: 支持传入 AbortSignal，便于在用户快速切换会话时取消过期请求
+  return request('/sessions', { signal });
 }
 
 export async function createSession(data: CreateSessionRequest): Promise<SessionSummary> {
@@ -388,9 +389,10 @@ export async function downloadReport(id: string, filename: string): Promise<void
   URL.revokeObjectURL(objectUrl);
 }
 
-export async function getSession(id: string): Promise<SessionDetail> {
+export async function getSession(id: string, signal?: AbortSignal): Promise<SessionDetail> {
+  // F-09: 支持传入 AbortSignal，便于在用户快速切换会话时取消过期请求
   // API returns { session: SessionDetail }, unwrap it
-  const raw = await request<{ session: SessionDetail }>(`/sessions/${id}`);
+  const raw = await request<{ session: SessionDetail }>(`/sessions/${id}`, { signal });
   return raw.session;
 }
 
@@ -435,135 +437,169 @@ export function streamMessage(
   onError: (err: Error) => void,
   onPrompt?: (prompt: PromptRequest) => void,
   onStep?: (step: ReasoningStep) => void,
+  // F-02: 重连成功时回调，UI 可据此提示"连接已恢复"
+  onReconnect?: () => void,
 ): AbortController {
   const controller = new AbortController();
 
+  // F-02: 断线重连参数——指数退避（1s/2s/4s），最多 3 次重试
+  const MAX_RETRIES = 3;
+  let reconnectTimer: number | null = null;
+
   console.log(`[SSE] Starting stream for session ${id} → ${apiBase}/sessions/${id}/messages/stream`);
-  fetch(`${apiBase}/sessions/${id}/messages/stream`, {
-    method: 'POST',
-    headers: { ...authHeaders(), 'Content-Type': 'application/json', Accept: 'text/event-stream' },
-    body: JSON.stringify(data),
-    signal: controller.signal,
-  })
-    .then(async (res) => {
-      console.log(`[SSE] Response status: ${res.status}, content-type: ${res.headers.get('content-type')}`);
-      if (!res.ok) throw new Error(`[${res.status}] ${res.statusText}`);
-      const reader = res.body?.getReader();
-      if (!reader) throw new Error('无响应数据流');
 
-      const decoder = new TextDecoder();
-      let buffer = '';
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
+  const performFetch = (attempt: number) => {
+    fetch(`${apiBase}/sessions/${id}/messages/stream`, {
+      method: 'POST',
+      headers: { ...authHeaders(), 'Content-Type': 'application/json', Accept: 'text/event-stream' },
+      body: JSON.stringify(data),
+      signal: controller.signal,
+    })
+      .then(async (res) => {
+        console.log(`[SSE] Response status: ${res.status}, content-type: ${res.headers.get('content-type')}`);
+        if (!res.ok) throw new Error(`[${res.status}] ${res.statusText}`);
+        // F-02: 非首次尝试且成功建立连接 → 通知 UI 已恢复
+        if (attempt > 0 && onReconnect) onReconnect();
+        const reader = res.body?.getReader();
+        if (!reader) throw new Error('无响应数据流');
 
-        const lines = buffer.split('\n');
-        buffer = lines.pop() || '';
+        const decoder = new TextDecoder();
+        let buffer = '';
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
 
-        let chunkText = '';
-        let currentEvent = '';
-        for (const line of lines) {
-          if (!line) { currentEvent = ''; continue; }
-          // Track SSE event name (sent before data)
-          if (line.startsWith('event: ')) {
-            currentEvent = line.slice(7).trim();
-            continue;
-          }
-          if (line.startsWith('data: ')) {
-            const data = line.slice(6).trim();
-            if (data === '[DONE]') {
-              console.log('[SSE] Received [DONE], flushing chunkText');
-              // CRITICAL: emit any accumulated chunkText before calling onDone
-              // otherwise the final event content is lost forever
-              if (chunkText) {
-                console.log(`[SSE] onChunk(${chunkText.length} chars) [DONE flush]`);
-                onChunk(chunkText);
-                chunkText = '';
-              }
-              onDone(); return;
+          const lines = buffer.split('\n');
+          buffer = lines.pop() || '';
+
+          let chunkText = '';
+          let currentEvent = '';
+          for (const line of lines) {
+            if (!line) { currentEvent = ''; continue; }
+            // Track SSE event name (sent before data)
+            if (line.startsWith('event: ')) {
+              currentEvent = line.slice(7).trim();
+              continue;
             }
-            try {
-              const parsed = JSON.parse(data);
-              console.log(`[SSE] event=${currentEvent} parsed.type=`, parsed.type || 'final');
-              // Web interactive prompts: password, confirmations, etc.
-              if (currentEvent === 'user_prompt' && onPrompt) {
-                onPrompt(parsed as PromptRequest);
-                currentEvent = '';
-                continue;
+            if (line.startsWith('data: ')) {
+              const data = line.slice(6).trim();
+              if (data === '[DONE]') {
+                console.log('[SSE] Received [DONE], flushing chunkText');
+                // CRITICAL: emit any accumulated chunkText before calling onDone
+                // otherwise the final event content is lost forever
+                if (chunkText) {
+                  console.log(`[SSE] onChunk(${chunkText.length} chars) [DONE flush]`);
+                  onChunk(chunkText);
+                  chunkText = '';
+                }
+                onDone(); return;
               }
-              // Reasoning / thinking-process steps: emitted with event=reasoning_step
-              // data.type is the step kind: tool_call | tool_output | handoff | agent_switched | message
-              if (currentEvent === 'reasoning_step' && onStep) {
-                onStep(parsed as ReasoningStep);
-                currentEvent = '';
-                continue;
-              }
-              // Handle tool/runner errors early so user sees them
-              if (parsed.type === 'error' && parsed.error) {
-                console.warn(`[SSE] Runner error: ${parsed.error}`);
-                chunkText += `\n\n⚠️ 运行错误: ${parsed.error}`;
-                currentEvent = '';
-                continue;
-              }
-              // done 事件的 content 是最终全文的快照（用于持久化），
-              // 不应追加到 chunkText——否则会与 delta 累积的正文重复。
-              // 只有 delta / text 类型才追加。
-              if (parsed.type !== 'done' && (parsed.text || parsed.content)) {
-                chunkText += parsed.text || parsed.content || '';
-              }
-              if (parsed.final_output) {
-                if (typeof parsed.final_output === 'string') {
-                  chunkText += parsed.final_output;
-                } else if (Array.isArray(parsed.final_output)) {
-                  const texts = parsed.final_output.map((b: any) => b?.text || '').filter(Boolean);
-                  if (texts.length) chunkText += texts.join('\n');
-                } else if (typeof parsed.final_output === 'object') {
-                  // Try common nested fields: .text, .output, .message, .result
-                  if (parsed.final_output.text) {
-                    chunkText += parsed.final_output.text;
-                  } else if (parsed.final_output.output) {
-                    chunkText += typeof parsed.final_output.output === 'string'
-                      ? parsed.final_output.output
-                      : JSON.stringify(parsed.final_output.output);
-                  } else if (parsed.final_output.message) {
-                    chunkText += typeof parsed.final_output.message === 'string'
-                      ? parsed.final_output.message
-                      : JSON.stringify(parsed.final_output.message);
-                  } else if (parsed.final_output.result) {
-                    chunkText += typeof parsed.final_output.result === 'string'
-                      ? parsed.final_output.result
-                      : JSON.stringify(parsed.final_output.result);
-                  } else {
-                    // Last resort: stringify the whole object
-                    const s = JSON.stringify(parsed.final_output);
-                    if (s !== '{}') chunkText += s;
+              try {
+                const parsed = JSON.parse(data);
+                console.log(`[SSE] event=${currentEvent} parsed.type=`, parsed.type || 'final');
+                // Web interactive prompts: password, confirmations, etc.
+                if (currentEvent === 'user_prompt' && onPrompt) {
+                  onPrompt(parsed as PromptRequest);
+                  currentEvent = '';
+                  continue;
+                }
+                // Reasoning / thinking-process steps: emitted with event=reasoning_step
+                // data.type is the step kind: tool_call | tool_output | handoff | agent_switched | message
+                if (currentEvent === 'reasoning_step' && onStep) {
+                  onStep(parsed as ReasoningStep);
+                  currentEvent = '';
+                  continue;
+                }
+                // Handle tool/runner errors early so user sees them
+                if (parsed.type === 'error' && parsed.error) {
+                  console.warn(`[SSE] Runner error: ${parsed.error}`);
+                  chunkText += `\n\n⚠️ 运行错误: ${parsed.error}`;
+                  currentEvent = '';
+                  continue;
+                }
+                // done 事件的 content 是最终全文的快照（用于持久化），
+                // 不应追加到 chunkText——否则会与 delta 累积的正文重复。
+                // 只有 delta / text 类型才追加。
+                if (parsed.type !== 'done' && (parsed.text || parsed.content)) {
+                  chunkText += parsed.text || parsed.content || '';
+                }
+                if (parsed.final_output) {
+                  if (typeof parsed.final_output === 'string') {
+                    chunkText += parsed.final_output;
+                  } else if (Array.isArray(parsed.final_output)) {
+                    const texts = parsed.final_output.map((b: any) => b?.text || '').filter(Boolean);
+                    if (texts.length) chunkText += texts.join('\n');
+                  } else if (typeof parsed.final_output === 'object') {
+                    // Try common nested fields: .text, .output, .message, .result
+                    if (parsed.final_output.text) {
+                      chunkText += parsed.final_output.text;
+                    } else if (parsed.final_output.output) {
+                      chunkText += typeof parsed.final_output.output === 'string'
+                        ? parsed.final_output.output
+                        : JSON.stringify(parsed.final_output.output);
+                    } else if (parsed.final_output.message) {
+                      chunkText += typeof parsed.final_output.message === 'string'
+                        ? parsed.final_output.message
+                        : JSON.stringify(parsed.final_output.message);
+                    } else if (parsed.final_output.result) {
+                      chunkText += typeof parsed.final_output.result === 'string'
+                        ? parsed.final_output.result
+                        : JSON.stringify(parsed.final_output.result);
+                    } else {
+                      // Last resort: stringify the whole object
+                      const s = JSON.stringify(parsed.final_output);
+                      if (s !== '{}') chunkText += s;
+                    }
                   }
                 }
+                // Always also check final_message (it's NOT mutually exclusive with final_output)
+                if (!chunkText && parsed.final_message && typeof parsed.final_message === 'string') {
+                  chunkText += parsed.final_message;
+                }
+              } catch {
+                // Plain text chunk
+                console.log(`[SSE] Non-JSON data:`, data.substring(0, 80));
+                chunkText += data;
               }
-              // Always also check final_message (it's NOT mutually exclusive with final_output)
-              if (!chunkText && parsed.final_message && typeof parsed.final_message === 'string') {
-                chunkText += parsed.final_message;
-              }
-            } catch {
-              // Plain text chunk
-              console.log(`[SSE] Non-JSON data:`, data.substring(0, 80));
-              chunkText += data;
             }
           }
+          if (chunkText) {
+            console.log(`[SSE] onChunk(${chunkText.length} chars)`);
+            onChunk(chunkText);
+          }
         }
-        if (chunkText) {
-          console.log(`[SSE] onChunk(${chunkText.length} chars)`);
-          onChunk(chunkText);
+        console.log('[SSE] Stream ended (reader done), calling onDone');
+        onDone();
+      })
+      .catch((err) => {
+        console.error('[SSE] Error:', err.name, err.message);
+        // 用户主动取消（abort）不重连
+        if (err.name === 'AbortError' || controller.signal.aborted) return;
+        // F-02: 断线自动重连——指数退避，最多 MAX_RETRIES 次
+        if (attempt < MAX_RETRIES) {
+          const backoff = Math.min(1000 * Math.pow(2, attempt), 8000);
+          console.log(`[SSE] 将在 ${backoff}ms 后重连（剩余 ${MAX_RETRIES - attempt} 次）`);
+          reconnectTimer = window.setTimeout(() => {
+            performFetch(attempt + 1);
+          }, backoff);
+          return;
         }
-      }
-      console.log('[SSE] Stream ended (reader done), calling onDone');
-      onDone();
-    })
-    .catch((err) => {
-      console.error('[SSE] Error:', err.name, err.message);
-      if (err.name !== 'AbortError') onError(err);
-    });
+        onError(err);
+      });
+  };
+
+  performFetch(0);
+
+  // 包装 abort：取消挂起的重连定时器，避免 abort 后又自动重连
+  const realAbort = controller.abort.bind(controller);
+  controller.abort = () => {
+    if (reconnectTimer) {
+      window.clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+    realAbort();
+  };
 
   return controller;
 }

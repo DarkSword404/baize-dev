@@ -73,6 +73,26 @@ export function MemoryGraphView({ snapshot }: { snapshot: MemoryGraphSnapshot })
   const [selected, setSelected] = useState<MemoryGraphNode | null>(null);
   const [zoom, setZoom] = useState(1);
   const wrapRef = useRef<HTMLDivElement>(null);
+  // F-11: 图虚拟化——大图延迟挂载，进入视口附近（200px 预加载）再渲染 SVG，
+  // 避免一进入记忆库页就同步绘制大量节点造成卡顿。
+  const [visible, setVisible] = useState(false);
+
+  useEffect(() => {
+    if (visible) return;
+    const el = wrapRef.current;
+    if (!el || typeof IntersectionObserver === 'undefined') {
+      setVisible(true); // 不支持 IO 时直接渲染
+      return;
+    }
+    const io = new IntersectionObserver((entries) => {
+      if (entries.some(e => e.isIntersecting)) {
+        setVisible(true);
+        io.disconnect();
+      }
+    }, { rootMargin: '200px' });
+    io.observe(el);
+    return () => io.disconnect();
+  }, [visible]);
 
   const { pos, index, resolvedEdges, skipped } = useMemo(() => {
     const index2 = new Map<string, MemoryGraphNode>();
@@ -133,6 +153,12 @@ export function MemoryGraphView({ snapshot }: { snapshot: MemoryGraphSnapshot })
       </div>
       <div className="relative border border-gray-800 rounded-xl overflow-hidden bg-gray-950/60 select-none">
         <div ref={wrapRef} className="overflow-auto max-h-[68vh]">
+          {/* F-11: 未进入视口时仅渲染占位骨架，避免大图同步绘制卡顿 */}
+          {!visible ? (
+            <div className="h-[60vh] flex items-center justify-center text-xs text-gray-600">
+              正在准备图谱可视化…
+            </div>
+          ) : (
           <svg width={W * zoom} height={H * zoom} viewBox={`0 0 ${W} ${H}`} className="block">
             <g transform={`scale(${zoom})`}>
               {resolvedEdges.map((e, i) => {
@@ -168,6 +194,7 @@ export function MemoryGraphView({ snapshot }: { snapshot: MemoryGraphSnapshot })
               })}
             </g>
           </svg>
+          )}
         </div>
         {selected && (
           <div className="absolute right-2 top-2 w-72 max-h-56 overflow-y-auto rounded-xl bg-gray-900/95 border border-gray-700/60 p-3 text-xs backdrop-blur">

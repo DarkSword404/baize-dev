@@ -38,10 +38,15 @@ class ParallelNodeExecutor(BaseNodeExecutor):
                     }
                 executor = get_executor(child_node.type)
                 result = await executor.execute(child_node, state)
+                # 读取子节点状态：子节点失败时分支也标记为 failed，
+                # 由父节点统一做失败传播（B-33）
+                child_nodes = (result or {}).get("nodes") or {}
+                child_rec = child_nodes.get(child_node.id, {}) if isinstance(child_nodes, dict) else {}
+                branch_status = "failed" if child_rec.get("status") == "failed" else "completed"
                 return {
                     "branch_id": branch.node_id,
                     "node_id": child_node.id,
-                    "status": "completed",
+                    "status": branch_status,
                     "result": result,
                 }
 
@@ -72,6 +77,26 @@ class ParallelNodeExecutor(BaseNodeExecutor):
                 sub_dialog = result_updates.get("dialog")
                 if isinstance(sub_dialog, list):
                     dialog_entries.extend(sub_dialog)
+
+            # B-33: 并行失败传播 —— 任一分支失败时把失败传播到父节点
+            failed_branches = [r for r in results if r.get("status") == "failed"]
+            if failed_branches:
+                err_summary = "; ".join(
+                    f"{r.get('branch_id', '?')}: {r.get('error', '子节点失败')}"
+                    for r in failed_branches
+                )
+                logger.warning(
+                    "Parallel 节点 '%s' 有 %d/%d 个分支失败，传播失败到父节点",
+                    node.id, len(failed_branches), len(branches),
+                )
+                updates.update(self._record_failed(node, state, f"并行分支失败: {err_summary}"))
+                updates["nodes"] = nodes
+                if dialog_entries:
+                    updates["dialog"] = dialog_entries
+                # 失败分支标记：若配置了 error_target 则路由到失败分支
+                updates["_err_route"] = node.id if getattr(node, "error_target", "") else ""
+                updates["route"] = ""
+                return updates
 
             data = {"branches": results, "total": len(branches), "completed": len(results)}
             updates.update(self._record_done(node, state, f"{len(results)} 个分支执行完毕", data))

@@ -119,3 +119,61 @@ class ArchiveManager:
             f.unlink()
             logger.info("已永久删除归档 %s", session_id)
             return True
+
+    # ---- B-28: 归档清理 ------------------------------------------------
+    def cleanup_old_archives(self, retention_days: int) -> int:
+        """B-28: 清理超过保留期的归档会话。
+
+        按 archived_at（缺省回退到文件 mtime）与当前时间差判断；
+        retention_days <= 0 表示不清理。返回被清理的归档数量。
+        """
+        if retention_days <= 0:
+            return 0
+        import time as _time
+        from datetime import timedelta
+        cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
+        cutoff_ts = cutoff.timestamp()
+        removed = 0
+        with self._lock:
+            for f in list(self._dir.glob("*.json")):
+                try:
+                    data = json.loads(f.read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, OSError):
+                    # 损坏的归档文件：按文件 mtime 兜底判断
+                    data = {}
+                # 优先用 archived_at，缺失则用文件 mtime
+                archived_at = data.get("archived_at") if isinstance(data, dict) else None
+                ts: float
+                if archived_at:
+                    try:
+                        ts = datetime.fromisoformat(archived_at).timestamp()
+                    except (ValueError, TypeError):
+                        ts = f.stat().st_mtime
+                else:
+                    ts = f.stat().st_mtime
+                if ts < cutoff_ts:
+                    try:
+                        f.unlink()
+                        removed += 1
+                        logger.info(
+                            "B-28 归档清理：删除过期归档 %s（archived_at=%s）",
+                            f.stem, archived_at or "(无 archived_at，按 mtime)",
+                        )
+                    except OSError:
+                        logger.warning("B-28 归档清理：删除失败 %s", f, exc_info=True)
+        if removed:
+            logger.info("B-28 归档清理完成：共删除 %d 个超过 %d 天的归档", removed, retention_days)
+        return removed
+
+
+def get_archive_retention_days() -> int:
+    """B-28: 从环境变量读取归档保留期（天数），默认 90 天。
+
+    BAIZE_ARCHIVE_RETENTION_DAYS=0 表示禁用自动清理。
+    """
+    import os as _os
+    raw = _os.environ.get("BAIZE_ARCHIVE_RETENTION_DAYS", "90")
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return 90

@@ -5,6 +5,17 @@ import type { ViewPage } from '../types';
 import type { JSX } from 'react';
 import { useEffect } from 'react';
 
+/** F-08: logo 加载失败时用文字徽标替代，避免显示破损图标 */
+function handleLogoFallback(e: React.SyntheticEvent<HTMLImageElement>) {
+  const el = e.currentTarget;
+  el.onerror = null;
+  const fb = document.createElement('div');
+  fb.className = 'w-8 h-8 rounded-lg bg-blue-600/20 flex items-center justify-center text-blue-300 font-bold text-sm';
+  fb.textContent = '白';
+  fb.setAttribute('aria-label', '白泽·智脑');
+  el.replaceWith(fb);
+}
+
 const NAV_ITEMS: Array<{ id: ViewPage; label: string; icon: string; path: string }> = [
   { id: 'dashboard', label: '控制台', path: '/dashboard', icon: 'M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6' },
   { id: 'chat', label: '任务管理', path: '/chat', icon: 'M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z' },
@@ -69,7 +80,7 @@ export function Sidebar(): JSX.Element {
     <aside className="w-56 min-w-[224px] bg-gray-900 border-r border-gray-800 flex flex-col select-none">
       {/* Logo */}
       <div className="px-5 py-4 border-b border-gray-800 flex items-center gap-3">
-        <img src="/logo.png" alt="白泽·智脑" className="w-8 h-8 rounded-lg object-contain" />
+        <img src="/logo.png" alt="白泽·智脑" onError={handleLogoFallback} className="w-8 h-8 rounded-lg object-contain" />
         <div>
           <div className="text-sm font-semibold tracking-tight">白泽·智脑</div>
           <div className="text-[10px] text-gray-500">AI 安全助手</div>

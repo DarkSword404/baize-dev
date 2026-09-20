@@ -13,6 +13,7 @@ import { Guardrails } from './pages/Guardrails';
 import { Experiences } from './pages/Experiences';
 import { Reports } from './pages/Reports';
 import { Settings } from './pages/Settings';
+import { NotFound } from './pages/NotFound';
 import type { JSX } from 'react';
 
 /** 条件渲染编排路由：仅在 baize-orchestration 模块已安装时可用 */
@@ -48,7 +49,8 @@ export default function App(): JSX.Element {
                   <Route path="reports" element={<ErrorBoundary><Reports /></ErrorBoundary>} />
                   <Route path="settings" element={<ErrorBoundary><Settings /></ErrorBoundary>} />
                 </Route>
-                <Route path="*" element={<Navigate to="/dashboard" replace />} />
+                {/* F-15: 未匹配路由的 404 兜底页，不再静默重定向 */}
+                <Route path="*" element={<ErrorBoundary><NotFound /></ErrorBoundary>} />
               </Routes>
             </AuthGuard>
           </ErrorBoundary>

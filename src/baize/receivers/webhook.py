@@ -2,6 +2,7 @@
 Webhook Receiver — 基于 FastAPI 的 HTTP 数据接收端点
 """
 
+import asyncio
 import hmac
 import logging
 import os
@@ -26,6 +27,51 @@ _SAFE_HEADERS = {
 # 显式事件 ID：若出现在 query 参数中，提升到 metadata 顶层，
 # 供收件箱按"告警自带 ID"计算幂等指纹并展示（见 inbox.compute_fingerprint）。
 _EVENT_ID_QUERY_KEYS = ("alert_id", "event_id")
+
+# B-16: webhook 缓冲 - 处理管道忙/未启动时，事件进入 asyncio.Queue 等待重投，
+# 不再直接返回 503 丢弃上游告警（旧版会让 SIEM/告警系统以为被拒绝而重试或丢失）。
+# 队列在首次 handle_webhook 调用时惰性创建（需运行中的事件循环）。
+_webhook_spool: "Optional[asyncio.Queue]" = None
+
+
+def _get_spool() -> "asyncio.Queue":
+    """B-16: 取（或惰性创建）webhook 缓冲队列。"""
+    global _webhook_spool
+    if _webhook_spool is None:
+        _webhook_spool = asyncio.Queue()
+    return _webhook_spool
+
+
+async def _drain_spool(manager: ReceiverManager) -> None:
+    """B-16: 管道可用时，重投缓冲队列里的事件。
+
+    仅在 accept_webhook 成功后调用，尽力排空缓冲；仍不可用的事件
+    回到队列尾部等待下次重投，避免一次 drain 阻塞。
+    """
+    spool = _get_spool()
+    # 最多处理队列当前长度条事件，避免无限循环
+    n = spool.qsize()
+    for _ in range(n):
+        try:
+            item = spool.get_nowait()
+        except asyncio.QueueEmpty:
+            return
+        receiver_id, data, content_type, source, metadata = item
+        try:
+            ok = manager.accept_webhook(
+                receiver_id=receiver_id,
+                data=data,
+                content_type=content_type,
+                source=source,
+                metadata=metadata,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("webhook 缓冲重投异常，事件回到队列")
+            ok = False
+        if not ok:
+            # 仍不可用：回到队列尾部等待下次重投
+            await spool.put(item)
+            return
 
 
 def _validate_webhook_key(request: Request) -> None:
@@ -97,14 +143,32 @@ async def handle_webhook(request: Request, path: str) -> Response:
     )
 
     if accepted:
+        # B-16: 管道可用，趁机把缓冲队列里积压的事件重投出去
+        try:
+            await _drain_spool(manager)
+        except Exception:  # noqa: BLE001
+            logger.warning("webhook 缓冲 drain 失败", exc_info=True)
         return Response(
             content='{"status":"accepted","receiver_id":"' + receiver_id + '"}',
             status_code=202,
             media_type="application/json",
         )
     else:
+        # B-16: 处理管道忙/未启动 — 缓冲而非丢弃
+        # 旧版直接返回 503 让上游丢数据；这里把事件入 asyncio.Queue，
+        # 等管道恢复后由后续任意一次成功的 accept_webhook 触发 drain 重投。
+        try:
+            spool = _get_spool()
+            await spool.put((receiver_id, raw, content_type, source, metadata))
+        except Exception:  # noqa: BLE001
+            logger.exception("webhook 事件入缓冲队列失败，回退到 503")
+            return Response(
+                content='{"status":"rejected","reason":"buffer failed"}',
+                status_code=503,
+                media_type="application/json",
+            )
         return Response(
-            content='{"status":"rejected","reason":"receiver not enabled or manager not running"}',
-            status_code=503,
+            content='{"status":"buffered","receiver_id":"' + receiver_id + '"}',
+            status_code=202,
             media_type="application/json",
         )

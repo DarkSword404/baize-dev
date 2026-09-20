@@ -13,9 +13,11 @@ from __future__ import annotations
 
 import json
 import asyncio
+import hashlib
 import inspect
 import logging
 import os
+import time
 
 import httpx
 import openai
@@ -70,6 +72,55 @@ _CONCLUDE_HINT_TOOL_TURNS = 5
 # 避免配置损坏时反复无效请求、拖垮整轮对话。
 _LLM_RETRY_ATTEMPTS = 4        # 额外重试次数（总尝试 = 1 + 4 = 5 次，退避 1s→2s→4s→8s，覆盖约 15 秒抖动窗口）
 _LLM_RETRY_BACKOFF_BASE = 1.0  # 指数退避基础秒数（1s -> 2s -> 4s -> 8s）
+
+# B-53: 响应缓存 —— 幂等 LLM 调用（同 prompt + 同 model + 同 temp + 无 tools）
+# 缓存 60 秒，避免短时间内重复请求同一个 prompt 浪费成本（如重放/多用户同问）。
+# 只缓存不含 tool_calls 的纯文本响应：tool_calls 含一次性 id，缓存后会破坏配对。
+_LLM_RESPONSE_CACHE_TTL = 60.0
+_LLM_RESPONSE_CACHE: dict[str, tuple[float, "CompletionResult"]] = {}
+
+
+def _llm_cache_key(
+    model: str,
+    history: list[ChatMessage],
+    temperature: float,
+    tools: Optional[list[dict]],
+) -> str:
+    """计算 LLM 响应缓存键：model + 消息序列化 + temperature + tools 摘要。"""
+    # 简单序列化：role/content/tool_calls/tool_call_id/name 都参与
+    parts: list[str] = [model or "", f"temp={temperature}"]
+    for m in history:
+        parts.append(f"{m.role}|{m.content or ''}|{m.tool_call_id or ''}|{m.name or ''}")
+        if m.tool_calls:
+            parts.append(json.dumps(m.tool_calls, ensure_ascii=False, sort_keys=True))
+    if tools:
+        parts.append(f"tools={json.dumps(tools, ensure_ascii=False, sort_keys=True)}")
+    return hashlib.sha1("\n".join(parts).encode("utf-8")).hexdigest()
+
+
+def _llm_cache_get(key: str) -> Optional["CompletionResult"]:
+    """读取缓存，过期或不存在返回 None。"""
+    entry = _LLM_RESPONSE_CACHE.get(key)
+    if entry is None:
+        return None
+    ts, result = entry
+    if time.time() - ts > _LLM_RESPONSE_CACHE_TTL:
+        # 过期：惰性清理
+        _LLM_RESPONSE_CACHE.pop(key, None)
+        return None
+    return result
+
+
+def _llm_cache_put(key: str, result: "CompletionResult") -> None:
+    """写入缓存（仅缓存无 tool_calls 的纯文本响应）。"""
+    if result.tool_calls:
+        return  # 含 tool_calls 的响应不缓存：避免一次性 id 复用破坏配对
+    _LLM_RESPONSE_CACHE[key] = (time.time(), result)
+    # 简单防泄漏：缓存超过 256 项时清理最旧的一半
+    if len(_LLM_RESPONSE_CACHE) > 256:
+        cutoff = time.time() - _LLM_RESPONSE_CACHE_TTL
+        for k in [k for k, (ts, _) in list(_LLM_RESPONSE_CACHE.items()) if ts < cutoff]:
+            _LLM_RESPONSE_CACHE.pop(k, None)
 
 # 工具执行超时：单次工具调用（含同步 handler 的线程池执行）超过该秒数
 # 即中止等待并返回超时错误文本给模型，防止工具挂起（网络卡住/subprocess
@@ -224,6 +275,39 @@ def _is_content_moderation_error(exc: Exception) -> bool:
             response_body = response_body.decode("utf-8", errors="ignore")
     haystack = f"{msg} {response_body}"
     return any(kw.lower() in haystack.lower() for kw in _DASHSCOPE_CONTENT_MODERATION_KEYWORDS)
+
+
+# B-50: 错误类型映射 —— 把 LLM API 异常映射到 actionable 错误类型，
+# 上层（编排器/前端）可据此给出统一处理（如 rate_limit → 退避提示，
+# auth → 引导用户重配 api_key，network → 提示重试，server_error → 提示稍后再试）。
+LLMErrorType = str  # Literal["rate_limit", "auth", "network", "server_error", "unknown"]
+
+
+def map_llm_error_type(exc: Exception) -> LLMErrorType:
+    """把 LLM API 异常映射到可操作的错误类型字符串。
+
+    返回值取值: ``rate_limit`` / ``auth`` / ``network`` / ``server_error`` / ``unknown``。
+    """
+    if isinstance(exc, openai.RateLimitError):
+        return "rate_limit"
+    if isinstance(exc, (openai.AuthenticationError, openai.PermissionDeniedError)):
+        return "auth"
+    if isinstance(exc, (openai.APITimeoutError, openai.APIConnectionError)):
+        return "network"
+    if isinstance(exc, _httpx_transport_exc_types()):
+        # httpx / httpx2 网络层异常
+        return "network"
+    if isinstance(exc, openai.InternalServerError):
+        return "server_error"
+    if isinstance(exc, openai.APIStatusError):
+        status = getattr(exc, "status_code", None) or 0
+        if status == 429:
+            return "rate_limit"
+        if status in (401, 403):
+            return "auth"
+        if status >= 500:
+            return "server_error"
+    return "unknown"
 
 
 def _is_retryable_llm_error(exc: Exception) -> bool:
@@ -769,6 +853,21 @@ class Agent:
         Returns:
             具有 ``complete`` / ``stream`` 方法的模型客户端实例。
         """
+        # B-54: provider 映射 —— 推断当前模型对应的 provider，写入审计日志，
+        # 便于按 provider 维度做错误归因（rate_limit/auth/...）与配额统计。
+        try:
+            from baize.sdk.models import resolve_provider
+            from baize.sdk.client import get_active_model_config
+
+            _cfg = get_active_model_config()
+            _provider = resolve_provider(self.model, _cfg.base_url if _cfg else None)
+            logger.debug(
+                "Agent %s 解析 provider: model=%s provider=%s",
+                self.name, self.model or "(default)", _provider,
+            )
+        except Exception:  # noqa: BLE001 — provider 推断失败不应阻塞主流程
+            pass
+
         if self.model_router is not None:
             return self.model_router.model(self.model_provider or self.model)
         if self.model_provider:
@@ -1061,6 +1160,15 @@ class Agent:
         if max_ctx_tokens <= 0:
             return history
 
+        # B-52: token 截断 —— 超出上下文窗口时记录告警，
+        # 标识裁剪前后的 token 数，便于运维定位"上下文越长越慢"的退化场景。
+        pre_tokens = self._estimate_history_tokens(history, tool_schemas)
+        if pre_tokens > max_ctx_tokens:
+            logger.warning(
+                "上下文 token 超出预算: estimated=%d, budget=%d，将裁剪最旧消息",
+                pre_tokens, max_ctx_tokens,
+            )
+
         # 骨架压缩（比直接删除更保留信息）
         self._compress_old_turns(history)
         if self._estimate_history_tokens(history, tool_schemas) <= max_ctx_tokens:
@@ -1084,6 +1192,12 @@ class Agent:
             if not removed:
                 # 仅剩最新一轮仍超预算：不再删除（保留协议完整），交由后续请求处理
                 break
+        post_tokens = self._estimate_history_tokens(history, tool_schemas)
+        if post_tokens > max_ctx_tokens:
+            logger.warning(
+                "上下文裁剪后仍超预算（剩 system + 最新一轮，已无法再删）: "
+                "estimated=%d, budget=%d", post_tokens, max_ctx_tokens,
+            )
         return history
 
     async def _trim_history_async(
@@ -1122,17 +1236,22 @@ class Agent:
         if not _is_retryable_llm_error(exc) or attempt > _LLM_RETRY_ATTEMPTS:
             return False
         delay = _LLM_RETRY_BACKOFF_BASE * (2 ** (attempt - 1))
+        # B-50: 错误类型映射 —— 把异常归类到 actionable error type，
+        # 便于审计日志过滤与上层（编排器/前端）给出统一处理提示。
+        error_type = map_llm_error_type(exc)
         self._log_event(
             "agent/retry",
             attempt=attempt,
             error=type(exc).__name__,
+            error_type=error_type,
             stream=stream,
             produced=produced,
             retry_in=round(delay, 2),
         )
         logger.warning(
-            "LLM 调用失败（%s%s%s），%.1fs 后重试（第 %d/%d 次）",
+            "LLM 调用失败（%s, error_type=%s%s%s），%.1fs 后重试（第 %d/%d 次）",
             type(exc).__name__,
+            error_type,
             "，连接阶段" if stream else "",
             "，流中断(已产出内容)" if produced else "",
             delay,
@@ -1154,11 +1273,27 @@ class Agent:
         ``_LLM_RETRY_ATTEMPTS`` 次；配置类错误（404/401/400/403 等）
         不重试，直接抛出，避免配置损坏时反复无效请求。
         """
+        # B-53: 响应缓存 —— 命中缓存时跳过实际 LLM 调用以节省成本
+        # （仅对相同 prompt+model+temp 的幂等调用，TTL 60s）。
+        cache_key = _llm_cache_key(
+            getattr(client, "model", "") or type(client).__name__,
+            history,
+            temperature=0.7,  # client.complete 默认值
+            tools=tool_schemas,
+        )
+        cached = _llm_cache_get(cache_key)
+        if cached is not None:
+            logger.debug("LLM 响应命中缓存（key=%s...），跳过实际调用", cache_key[:12])
+            return cached
+
         attempt = 0
         while True:
             attempt += 1
             try:
-                return await client.complete(history, tools=tool_schemas)
+                result = await client.complete(history, tools=tool_schemas)
+                # B-53: 命中成功响应后写回缓存（含 tool_calls 的响应会被 _llm_cache_put 自动跳过）
+                _llm_cache_put(cache_key, result)
+                return result
             except Exception as exc:  # noqa: BLE001
                 if not await self._maybe_retry_llm(exc, attempt):
                     raise
@@ -1235,6 +1370,9 @@ class Agent:
         self._ensure_session_started()
         turn_index = 0
         forced_conclusion = False  # 空回复兜底：最多强制续写一次
+        # B-07: 工具调用循环检测——同一 (tool, args) 连续 3 次视为死循环
+        _seen_calls: dict[str, int] = {}
+        _LOOP_THRESHOLD = 3
         for _ in range(self.max_tool_calls):
             # 合并 agent 上一轮通过 load_tool 挂载的工具，下一次 LLM
             # 请求立即携带其完整 schema（两级工具体系动态加载点）。
@@ -1266,6 +1404,17 @@ class Agent:
                     fn = tc.get("function", {})
                     name = fn.get("name", "")
                     arguments = fn.get("arguments", "{}")
+                    # B-07: 循环检测——同一工具+参数重复调用超过阈值则短路
+                    _call_key = f"{name}:{hashlib.sha1(arguments.encode()).hexdigest()[:16]}"
+                    _seen_calls[_call_key] = _seen_calls.get(_call_key, 0) + 1
+                    if _seen_calls[_call_key] >= _LOOP_THRESHOLD:
+                        output = f"(工具调用循环检测：{name} 以相同参数已重复调用 " \
+                                 f"{_seen_calls[_call_key]} 次，已跳过。请尝试不同参数或换用其他工具。)"
+                        self._log_event("tool/result", name=name, output=output, denied=True, reason="loop_detection")
+                        history.append(ChatMessage(role="tool", content=output,
+                            tool_call_id=tc.get("id", ""), name=name))
+                        await self._emit("on_tool_result", self, name, output)
+                        continue
                     tool = tool_by_name.get(name)
                     self._log_event("tool/call", name=name, arguments=arguments)
                     if tool is None:
@@ -1671,6 +1820,9 @@ class Agent:
             conclusion_hint_added = False     # 是否已追加阶段性结论提示（避免重复）
             guard_forced_conclusion = False   # ProgressGuard 已给过最后结论机会
             turn_index = 0
+            # B-07: 工具调用循环检测（流式版）
+            _seen_calls: dict[str, int] = {}
+            _LOOP_THRESHOLD = 3
 
             for _ in range(self.max_tool_calls):
                 # 动态工具合并：本轮 load_tool 挂载的工具，下一次 LLM 请求生效
@@ -1752,6 +1904,22 @@ class Agent:
                     for tc in tool_calls:
                         fn = tc.get("function", {})
                         name = fn.get("name", "")
+                        arguments = fn.get("arguments", "{}")
+                        # B-07: 流式版循环检测
+                        _call_key = f"{name}:{hashlib.sha1(arguments.encode()).hexdigest()[:16]}"
+                        _seen_calls[_call_key] = _seen_calls.get(_call_key, 0) + 1
+                        if _seen_calls[_call_key] >= _LOOP_THRESHOLD:
+                            _loop_output = f"(工具调用循环检测：{name} 以相同参数已重复调用 " \
+                                     f"{_seen_calls[_call_key]} 次，已跳过。请尝试不同参数或换用其他工具。)"
+                            if not tool_call_seq:
+                                tool_call_seq = {}
+                            tc_id = tc.get("id") or f"call_{len(tool_call_seq)}"
+                            tool_call_seq.setdefault(tc_id, True)
+                            self._log_event("tool/result", name=name, output=_loop_output, denied=True, reason="loop_detection")
+                            history.append(ChatMessage(role="tool", content=_loop_output,
+                                tool_call_id=tc_id, name=name))
+                            yield AgentEvent(type="tool_result", name=name, content=_loop_output)
+                            continue
                         # 生成稳定的工具调用 ID（模型未返回 id 时用序号兜底），
                         # 供会话持久化配对 function_call / function_call_output，
                         # 这样"继续"时历史可以无损重建，避免任务从头重跑。

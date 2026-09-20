@@ -8,12 +8,15 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sqlite3
 import threading
 import time
 from pathlib import Path
 from typing import Any, Literal
+
+logger = logging.getLogger(__name__)
 
 JobStatus = Literal["pending", "running", "completed", "failed", "paused"]
 
@@ -40,6 +43,20 @@ CREATE TABLE IF NOT EXISTS runs (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_dedup_key
     ON runs(dedup_key) WHERE dedup_key IS NOT NULL AND dedup_key != '';
+
+-- B-35: events 拆表 —— 流水线事件独立存表，避免与 session log 混在一起，
+-- 同时支持高效按 run_id 增量查询（重连补齐场景）。events_count 留在 runs
+-- 表作为快速访问字段，详细事件走 pipeline_events。
+CREATE TABLE IF NOT EXISTS pipeline_events (
+    event_id   TEXT NOT NULL,
+    run_id     TEXT NOT NULL,
+    seq        INTEGER NOT NULL,
+    type       TEXT NOT NULL,
+    timestamp  REAL NOT NULL,
+    data       TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_pipeline_events_run_seq
+    ON pipeline_events(run_id, seq);
 """
 
 # 旧库渐进式迁移：给既有 runs 表补充对话相关列（幂等）
@@ -47,6 +64,23 @@ _MIGRATIONS = [
     "ALTER TABLE runs ADD COLUMN dialog TEXT NOT NULL DEFAULT '[]'",
     "ALTER TABLE runs ADD COLUMN dialog_action TEXT NOT NULL DEFAULT ''",
 ]
+
+# B-35: events 拆表 —— 旧库迁移：把 runs.events JSON 数组迁移到 pipeline_events 表（幂等）
+_EVENT_MIGRATION = """
+INSERT OR IGNORE INTO pipeline_events (event_id, run_id, seq, type, timestamp, data)
+SELECT
+    json_extract(e.value, '$.event_id') AS event_id,
+    r.run_id AS run_id,
+    json_extract(e.value, '$') IS NOT NULL AS seq,
+    COALESCE(json_extract(e.value, '$.type'), 'unknown') AS type,
+    COALESCE(json_extract(e.value, '$.timestamp'), 0) AS timestamp,
+    COALESCE(json_extract(e.value, '$.data'), '{}') AS data
+FROM runs r, json_each(r.events) e
+WHERE r.events != '[]' AND r.events IS NOT NULL
+"""
+
+# B-36: 溢出日志 —— 单 run 累计事件数超过该阈值时打印告警日志
+EVENT_OVERFLOW_THRESHOLD = 1000
 
 
 class RunRecord:
@@ -140,6 +174,13 @@ class RunStore:
                     self._conn.commit()
                 except sqlite3.OperationalError:
                     pass  # 列已存在
+            # B-35: events 拆表 —— 老库迁移：把 runs.events JSON 数组搬到
+            # pipeline_events 表（INSERT OR IGNORE 幂等，重复执行无副作用）
+            try:
+                self._conn.executescript(_EVENT_MIGRATION)
+                self._conn.commit()
+            except sqlite3.OperationalError:
+                pass  # 迁移失败不阻塞启动
 
     # ------------------------------------------------------------ 内部工具
     @staticmethod
@@ -224,13 +265,38 @@ class RunStore:
             self._persist(rec)
 
     def add_event(self, run_id: str, event: dict[str, Any]) -> None:
-        """追加事件到历史列表。"""
+        """追加事件到历史列表。
+
+        B-35: events 拆表 —— 同时写入独立的 pipeline_events 表（按 seq 自增），
+        并保留 rec.events JSON 数组以向后兼容（如 brief() 的 events_count）。
+        """
         with self._lock:
             rec = self._fetch(run_id)
             if not rec:
                 return
             rec.events.append(event)
             self._persist(rec)
+            # B-35: 同步写入独立事件表，event_id 重复时跳过（INSERT OR IGNORE 幂等）
+            seq = len(rec.events) - 1
+            self._conn.execute(
+                "INSERT OR IGNORE INTO pipeline_events "
+                "(event_id, run_id, seq, type, timestamp, data) VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    str(event.get("event_id") or f"{run_id}_{seq}"),
+                    run_id,
+                    seq,
+                    str(event.get("type", "unknown")),
+                    float(event.get("timestamp") or 0.0),
+                    json.dumps(event.get("data", {}), ensure_ascii=False),
+                ),
+            )
+            self._conn.commit()
+            # B-36: 溢出日志 —— 单 run 累计事件数超阈值时告警
+            if len(rec.events) == EVENT_OVERFLOW_THRESHOLD:
+                logger.warning(
+                    "run %s 事件数已达 %d 阈值，可能存在事件风暴或日志配置问题",
+                    run_id, EVENT_OVERFLOW_THRESHOLD,
+                )
 
     def add_node_record(self, run_id: str, node_id: str, record: dict[str, Any]) -> None:
         with self._lock:
@@ -339,7 +405,40 @@ class RunStore:
         return [r.brief() for r in records[:limit]]
 
     def get_events_since(self, run_id: str, last_event_id: str = "") -> list[dict[str, Any]]:
-        """获取指定事件之后的增量事件（用于重连补齐）。"""
+        """获取指定事件之后的增量事件（用于重连补齐）。
+
+        B-35: events 拆表 —— 优先从 pipeline_events 表读取（增量高效），
+        表为空时回退到 runs.events JSON 数组（兼容尚未迁移的旧 run）。
+        """
+        with self._lock:
+            # 优先走独立事件表
+            rows = self._conn.execute(
+                "SELECT event_id, type, timestamp, data FROM pipeline_events "
+                "WHERE run_id = ? ORDER BY seq",
+                (run_id,),
+            ).fetchall()
+        if rows:
+            events = [
+                {
+                    "event_id": r["event_id"],
+                    "type": r["type"],
+                    "run_id": run_id,
+                    "timestamp": r["timestamp"],
+                    "data": json.loads(r["data"] or "{}"),
+                }
+                for r in rows
+            ]
+            if last_event_id:
+                try:
+                    idx = next(
+                        i for i, e in enumerate(events)
+                        if e.get("event_id") == last_event_id
+                    )
+                    return events[idx + 1:]
+                except StopIteration:
+                    return []
+            return events
+        # 回退：旧 run 的 events 仍存在 runs.events JSON 数组
         with self._lock:
             rec = self._fetch(run_id)
             if not rec:

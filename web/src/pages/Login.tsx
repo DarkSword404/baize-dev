@@ -5,6 +5,17 @@ interface Props {
   onLogin: () => void;
 }
 
+/** F-08: logo 加载失败时用文字徽标替代，避免显示破损图标 */
+function handleLogoFallback(e: React.SyntheticEvent<HTMLImageElement>) {
+  const el = e.currentTarget;
+  el.onerror = null;
+  const fb = document.createElement('div');
+  fb.className = 'w-12 h-12 rounded-xl mb-4 mx-auto bg-blue-600/20 flex items-center justify-center text-blue-300 font-bold text-xl';
+  fb.textContent = '白';
+  fb.setAttribute('aria-label', '白泽·智脑');
+  el.replaceWith(fb);
+}
+
 export function Login({ onLogin }: Props) {
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
@@ -42,7 +53,7 @@ export function Login({ onLogin }: Props) {
       <div className="w-full max-w-sm">
         {/* Logo / Title */}
         <div className="text-center mb-8">
-          <img src="/logo.png" alt="白泽·智脑" className="w-12 h-12 rounded-xl mb-4 object-contain mx-auto" />
+          <img src="/logo.png" alt="白泽·智脑" onError={handleLogoFallback} className="w-12 h-12 rounded-xl mb-4 object-contain mx-auto" />
           <h1 className="text-xl font-semibold text-white">白泽·智脑</h1>
           <p className="text-sm text-gray-500 mt-1">登录以继续</p>
         </div>

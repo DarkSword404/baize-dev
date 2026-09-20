@@ -1,0 +1,37 @@
+# X-07: systemd 服务单元文件 —— 用于 Linux 服务器部署
+# 安装: sudo cp deploy/baize.service /etc/systemd/system/ && sudo systemctl daemon-reload
+# 启动: sudo systemctl enable --now baize
+# 查看日志: journalctl -u baize -f
+
+[Unit]
+Description=Baize AI Cybersecurity SOAR Platform
+After=network.target docker.service
+Wants=docker.service
+
+[Service]
+Type=simple
+User=baize
+Group=baize
+WorkingDirectory=/opt/baize
+Environment=PYTHONUNBUFFERED=1
+Environment=BAIZE_LOG_FORMAT=json
+Environment=BAIZE_LOG_FILE=/var/log/baize/baize.log
+Environment=BAIZE_LOG_LEVEL=INFO
+Environment=BAIZE_RATE_LIMIT=60
+EnvironmentFile=-/opt/baize/.env
+ExecStart=/opt/baize/.venv/bin/python -m baize api serve --host 0.0.0.0 --port 9877
+Restart=on-failure
+RestartSec=5
+KillMode=control-group
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+# 安全加固
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/opt/baize/data /var/log/baize
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
