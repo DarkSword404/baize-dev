@@ -17,6 +17,7 @@ import logging
 import os
 import shutil
 import sys
+import time
 from pathlib import Path
 from dataclasses import replace as _dataclass_replace
 from importlib.metadata import entry_points
@@ -375,6 +376,97 @@ def _is_continue_intent(text: str) -> bool:
     return any(t.startswith(k) for k in ("继续", "接着", "continue", "keep going"))
 
 
+# follow-up 意图：解析用户对"下一步建议"的响应
+# 返回 (action, detail) 元组：
+#   ("writeup", ...)   → 生成报告/Writeup
+#   ("select", N)      → 选择第 N 条建议（1-based）
+#   ("continue", ...)  → 继续执行（最高优先级）
+#   None               → 非 follow-up，走正常编排
+def _parse_follow_up_intent(text: str) -> tuple[str, str] | None:
+    """解析用户对"下一步建议"的响应意图。
+
+    支持三种指令：
+    - "继续"/"continue" → 执行最高优先级建议
+    - "1"/"2"/"3" 等编号 → 选择对应编号的建议
+    - "生成 Writeup"/"写报告" 等 → 直接触发报告生成
+    """
+    t = (text or "").strip()
+    if not t or len(t) > 30:
+        return None
+    lower = t.lower()
+
+    # 生成 Writeup / 写报告 / 生成报告
+    if any(k in lower for k in ("writeup", "write up", "write-up", "wp", "生成报告", "写报告", "出报告", "生成 writeup", "报告")):
+        return ("writeup", "")
+    # 纯数字选择（1-9）
+    if lower.isdigit() and 1 <= int(lower) <= 9:
+        return ("select", lower)
+    # 继续
+    if _is_continue_intent(t):
+        return ("continue", "")
+    return None
+
+
+_TASK_TYPES = ("general", "pentest", "ctf", "forensics")
+
+
+def _resolve_task_type(session: Any, user_input: str) -> str:
+    """判定会话的任务类型（general | pentest | ctf | forensics）。
+
+    优先级：会话显式 task_type > 黑板已落盘的分类 > 关键词启发式。
+    返回空串表示"无法判定" —— 调用方应保持原编排路径，不猜测降级。
+    """
+    t = str(getattr(session, "task_type", "") or "").strip().lower()
+    if t in _TASK_TYPES:
+        return t
+    blackboard = getattr(session, "blackboard", None)
+    if blackboard is not None:
+        # 已有攻击图：只认已落盘的分类，避免把进行中的任务误判为通用对话
+        try:
+            goal = blackboard.goal_node()
+            props = (goal.properties if goal else None) or {}
+            t = str(props.get("task_type") or "").strip().lower()
+        except Exception:  # noqa: BLE001
+            t = ""
+        return t if t in _TASK_TYPES else ""
+    # 新会话且未指定类型：用项目自带的关键词规则做低成本判定
+    try:
+        from baize.pentest.agent_tools import classify_task
+
+        t = str(classify_task(user_input or "").get("task_type") or "").strip().lower()
+    except Exception:  # noqa: BLE001
+        return ""
+    return t if t in _TASK_TYPES else ""
+
+
+def _create_general_chat_agent(session_id: str, session_log: Any, extra_tools: list) -> Any:
+    """通用对话用的轻量 agent：不挂黑板、不做授权范围拦截、不写入攻击图。
+
+    与编排路径的区别：不做 Reason→动态 agent→act 的多波调度，
+    直接用模型对话（会话历史 / 附件工具 / 记忆注入全部保留）。
+    """
+    from baize.pentest.dynamic_agent import AgentSpec, DynamicAgentFactory
+
+    spec = AgentSpec(
+        role_prompt=(
+            "你是通用对话助手。直接、准确、简洁地回答用户的问题；"
+            "只有用户明确提出要求时才调用工具，不要主动发起扫描或安全测试。"
+        ),
+        tools=[],
+        reasoning="",
+        confidence=0.9,
+    )
+    agent = DynamicAgentFactory().create_agent(
+        spec,
+        session_id=session_id,
+        session_log=session_log,
+        extra_tools=extra_tools or [],
+        task_type="general",
+        enforce_scope=False,
+    )
+    return _clone_agent_for_session(agent, session_id, session_log)
+
+
 def _rebuild_prior_history(history_messages: list[dict]) -> list[ChatMessage]:
     """将会话持久化消息重建为传给模型的完整 ChatMessage 历史。
 
@@ -519,12 +611,21 @@ def _format_detailed_error(exc: Exception, phase: str = "对话处理") -> str:
     )
 
 
-async def _with_sse_heartbeat(agen, interval: float = 15.0):
+async def _with_sse_heartbeat(
+    agen,
+    interval: float = 15.0,
+    cancel_event: "asyncio.Event | None" = None,
+):
     """包装异步生成器，静默期定期产出心跳，防止长时工具执行导致连接超时断开。
 
     产出形式为 ``(kind, item)``：
     - ``("event", event)``：上游生成器产出的原始事件
     - ``("heartbeat", None)``：超过 ``interval`` 秒无事件时产出的心跳标记
+
+    ``cancel_event``：会话取消信号（由"停止"端点 set）。一旦置位，本包装器
+    立即停止等待并退出，``finally`` 会取消上游任务并 ``aclose()`` 生成器，
+    从而中断正在飞行的 LLM 请求与 agent 执行。没有它时，"停止"只能等本轮
+    自然结束（此前 cancel 端点是空操作，点了根本停不下来）。
 
     调用方对心跳标记应输出真正的 SSE 事件（``event: ping``），而非注释行。
     部分反向代理/CDN（如 Trae preview 网关）不把 SSE 注释行（``:`` 开头）视为有效数据，
@@ -534,16 +635,27 @@ async def _with_sse_heartbeat(agen, interval: float = 15.0):
     """
     next_task: asyncio.Task | None = None
     sleep_task: asyncio.Task | None = None
+    cancel_wait: asyncio.Task | None = None
     try:
         while True:
+            # 用户点了停止：立即退出（finally 会 cancel + aclose 上游生成器）
+            if cancel_event is not None and cancel_event.is_set():
+                return
             if next_task is None:
                 next_task = asyncio.ensure_future(agen.__anext__())
             if sleep_task is None:
                 sleep_task = asyncio.ensure_future(asyncio.sleep(interval))
+            wait_set = {next_task, sleep_task}
+            if cancel_event is not None:
+                # 与取消信号一同等待：无需等满一个心跳间隔即可响应停止
+                cancel_wait = asyncio.ensure_future(cancel_event.wait())
+                wait_set.add(cancel_wait)
             done, _ = await asyncio.wait(
-                {next_task, sleep_task},
+                wait_set,
                 return_when=asyncio.FIRST_COMPLETED,
             )
+            if cancel_event is not None and cancel_event.is_set():
+                return
             if next_task in done:
                 if sleep_task is not None and not sleep_task.done():
                     # B-30: 心跳 await — cancel 后需 await 让取消传播，
@@ -567,7 +679,7 @@ async def _with_sse_heartbeat(agen, interval: float = 15.0):
     finally:
         # B-30: 心跳 await — 清理时尚在运行的 task 必须 await 取消，
         # 不能 fire-and-forget（仅 cancel 不 await 会让任务悬空）。
-        for t in (next_task, sleep_task):
+        for t in (next_task, sleep_task, cancel_wait):
             if t is not None and not t.done():
                 t.cancel()
                 try:
@@ -587,6 +699,55 @@ async def _with_sse_heartbeat(agen, interval: float = 15.0):
 # ----------------------------------------------------------------------
 _active_session_tasks: dict[str, "asyncio.Task"] = {}
 
+# 会话取消信号表：session_id -> asyncio.Event。
+# "停止/中断"端点置位后，SSE 心跳包装器立即退出并 aclose 编排生成器，
+# 从而中断正在飞行的 LLM 请求与 agent 执行。
+# （此前 cancel/interrupt 端点只做会话存在性校验就返回 success，
+#   是空操作 —— 用户点了停止，后端仍在跑完整个流程。）
+_session_cancel: dict[str, "asyncio.Event"] = {}
+
+
+def _cancel_session_run(session_id: str) -> bool:
+    """真正终止指定会话正在运行的编排流；返回是否确有运行中任务被取消。
+
+    三步：
+    1. 置位取消信号 → SSE 心跳包装器立即退出并 ``aclose()`` 编排生成器，
+       中断正在飞行的 LLM 请求与 agent 执行；
+    2. 取消单飞表 / SSE leader 表中仍在运行的任务；
+    3. 向该会话所有 follower 队列投递 None 哨兵，让它们一并退出。
+    """
+    cancelled = False
+
+    ev = _session_cancel.get(session_id)
+    if ev is None:
+        # 流尚未建立（或已结束）：预置一个已置位的信号，保证随后启动的
+        # 编排会被立刻终止，避免"取消了个寂寞"
+        ev = asyncio.Event()
+        ev.set()
+        _session_cancel[session_id] = ev
+    elif not ev.is_set():
+        ev.set()
+        cancelled = True
+
+    task = _active_session_tasks.get(session_id)
+    if task is not None and not task.done():
+        task.cancel()
+        cancelled = True
+
+    entry = _session_sse_leaders.get(session_id)
+    if entry is not None:
+        leader_task, subs = entry
+        if not leader_task.done():
+            leader_task.cancel()
+            cancelled = True
+        for q in list(subs):
+            try:
+                q.put_nowait(None)
+            except Exception:  # noqa: BLE001
+                pass
+
+    return cancelled
+
 
 # ----------------------------------------------------------------------
 # B-15: SSE 单飞（single-flight pipeline）注册表
@@ -600,6 +761,49 @@ _session_sse_leaders: dict[str, tuple["asyncio.Task", list["asyncio.Queue"]]] = 
 # ----------------------------------------------------------------------
 # 会话审计日志：SessionLog 生产接线辅助
 # ----------------------------------------------------------------------
+async def _finalize_session_learning(app: FastAPI, session_id: str) -> dict:
+    """会话结束时把整段会话轨迹沉淀为长期记忆（幂等：一个会话只学一次）。
+
+    学习时机由「每回合」改为「会话结束」：每回合都固化一个 Episode 会让长会话
+    产出大量互相包含、内容重叠的 Episode 与经验。这里统一收口——删除会话、
+    空闲超时、手动调用三条路径最终都走这里。
+    """
+    if session_id in app.state.learned_sessions:
+        return {"ok": True, "skipped": "already-learned"}
+    app.state.learned_sessions.add(session_id)
+    log = app.state.session_logs.get(session_id)
+    if log is None:
+        return {"ok": True, "skipped": "no-session-log"}
+    try:
+        from baize.sdk.agent import learn_session
+
+        out = await learn_session(log, session_id=session_id, agent_key="")
+        return {"ok": True, "result": out}
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("会话记忆学习失败 session=%s: %s", session_id, exc)
+        return {"ok": False, "error": str(exc)}
+
+
+def _sweep_idle_session_learning(app: FastAPI, idle_seconds: int = 1800) -> None:
+    """空闲兜底：把超过阈值（默认 30 分钟）未活动的会话触发学习。
+
+    只依赖「删除会话」这一个显式信号不够——用户可能从不删会话，那样记忆就
+    永远不会更新。这里在每次对话请求时顺带检查，把超时的旧会话以后台任务
+    收尾，不阻塞当前请求。
+    """
+    now = time.time()
+    try:
+        for sid, ts in list(app.state.session_last_active.items()):
+            if sid in app.state.learned_sessions or now - ts <= idle_seconds:
+                continue
+            task = asyncio.create_task(_finalize_session_learning(app, sid))
+            app.state._memory_bg_tasks.add(task)
+            task.add_done_callback(app.state._memory_bg_tasks.discard)
+    except RuntimeError:
+        # 无运行中的事件循环（同步上下文）：静默跳过，下次请求再试
+        return
+
+
 def _get_or_create_session_log(app: FastAPI, session_id: str) -> SessionLog:
     """取（或建）会话级 SessionLog，JSONL 落盘 ~/.baize/sessions/<id>.audit.jsonl。
 
@@ -723,20 +927,11 @@ def create_baize_api_app(
             logger.info("B-28 启动归档清理：删除 %d 个超过 %d 天的归档", _removed, _retention)
     except Exception:  # noqa: BLE001
         logger.warning("B-28 启动归档清理失败", exc_info=True)
-    # 启动时对账：扫描运行中 baize-sandbox-* 容器，重建注册表（孤儿/停止状态）
-    try:
-        from baize.pentest.workspace import get_container_manager
-        mgr = get_container_manager()
-        if mgr.runtime_available:
-            stats = app.state.container_registry.reconcile(mgr)
-            if stats.get("orphan", 0) > 0:
-                logger.warning(
-                    "检测到 %d 个孤儿容器（session 已归档/删除但容器仍在），"
-                    "可在容器管理页面清理。",
-                    stats["orphan"],
-                )
-    except Exception:  # noqa: BLE001
-        logger.debug("容器注册表对账失败", exc_info=True)
+    # 启动时对账已移至下方 @app.on_event("startup") 钩子：
+    # container_registry.reconcile() 现为协程，必须在事件循环内 await。
+    # 在构建期（create_baize_api_app 体内）调用 asyncio.run() 会因
+    # "cannot be called from a running event loop" 静默失败，导致重启后
+    # 沙箱容器无法重连。
 
     # 全局 app state 引用：供编排进程（reason 节点等）反查会话黑板
     global _APP_STATE_REF
@@ -745,6 +940,12 @@ def create_baize_api_app(
     # 全新实现（baize.memory），取代历史上所有经验引擎。Agent 每回合结束自动
     # 学习（见 sdk.agent._try_auto_refine），此处只负责注册全局服务。
     app.state.memory_service = MemoryService()
+    # 会话级记忆学习（每回合学习已废弃：长会话会产出大量互相包含的重叠 Episode）
+    # learned_sessions：已学习的会话，保证一个会话只沉淀一次（幂等）
+    # session_last_active：会话最后活跃时间，用于空闲超时兜底触发学习
+    app.state.learned_sessions: set[str] = set()
+    app.state.session_last_active: dict[str, float] = {}
+    app.state._memory_bg_tasks: set = set()
 
     # ── 会话审计日志：SessionLog JSONL 落盘目录 + 进程内缓存 ──
     app.state.session_log_dir = os.path.join(str(DEFAULT_BAIZE_DIR), "sessions")
@@ -802,6 +1003,28 @@ def create_baize_api_app(
     app.include_router(receivers_router, prefix="/api/v1")
 
     @app.on_event("startup")
+    async def _reconcile_containers():
+        """应用启动时对账沙箱容器：重连已有容器、标记孤儿/已停止。
+
+        必须在事件循环内 await —— ``reconcile()`` 已是协程，在构建期
+        （``create_baize_api_app`` 体内）用 ``asyncio.run()`` 调用会抛
+        "cannot be called from a running event loop"，使对账静默失败。
+        """
+        try:
+            from baize.pentest.workspace import get_container_manager
+            mgr = get_container_manager()
+            if mgr.runtime_available:
+                stats = await app.state.container_registry.reconcile(mgr)
+                if stats.get("orphan", 0) > 0:
+                    logger.warning(
+                        "检测到 %d 个孤儿容器（session 已归档/删除但容器仍在），"
+                        "可在容器管理页面清理。",
+                        stats["orphan"],
+                    )
+        except Exception:  # noqa: BLE001
+            logger.debug("容器注册表对账失败", exc_info=True)
+
+    @app.on_event("startup")
     async def _start_receiver_manager():
         """应用启动时初始化 ReceiverManager 并启动所有已启用的接收器。"""
         mgr = ReceiverManager.get()
@@ -813,6 +1036,39 @@ def create_baize_api_app(
         """应用关闭时停止所有接收器。"""
         mgr = ReceiverManager.get()
         await mgr.stop()
+
+    @app.on_event("shutdown")
+    async def _flush_pending_session_learning():
+        """应用退出时，把还没学习过的会话收尾沉淀一次。
+
+        平时学习由请求处理中的空闲扫描触发；用户聊完最后一句就离开、之后不再
+        发请求，那段会话的轨迹就一直沉淀不下来。这里在退出时兜底补一次。
+
+        刻意做成一次性动作而非常驻周期轮询：本项目没有常驻周期任务的先例
+        （``asyncio.create_task`` 全部是一次性任务，常驻的只有事件驱动的
+        screencast 流），不为了兜底引入一种新的运行时形态。代价是不覆盖进程
+        崩溃/强杀，那种情况轨迹仍在 JSONL 里，重启后由空闲扫描补学。
+        """
+        try:
+            pending = [
+                sid for sid in list(getattr(app.state, "session_logs", {}) or {})
+                if sid not in app.state.learned_sessions
+            ]
+            for sid in pending:
+                await _finalize_session_learning(app, sid)
+            if pending:
+                logger.info("退出前补学 %d 个会话", len(pending))
+        except Exception:  # noqa: BLE001
+            logger.debug("退出前记忆收尾失败", exc_info=True)
+
+    @app.on_event("shutdown")
+    async def _cancel_memory_bg_tasks():
+        """应用关闭时取消记忆后台任务，避免任务残留到已关闭的事件循环。"""
+        tasks = list(getattr(app.state, "_memory_bg_tasks", None) or set())
+        for t in tasks:
+            t.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     # Webhook 捕获所有路由
     @app.api_route("/api/v1/hook/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
@@ -833,8 +1089,8 @@ def create_baize_api_app(
         checks: dict[str, bool] = {}
         # 1. 模型配置是否存在
         try:
-            mgr = getattr(app.state, "model_manager", None)
-            checks["model_config"] = bool(mgr and mgr.get_config())
+            mgr = getattr(app.state, "model_config", None)
+            checks["model_config"] = bool(mgr and mgr.load())
         except Exception:  # noqa: BLE001
             checks["model_config"] = False
         # 2. 认证数据库可写（SQLite）
@@ -845,8 +1101,11 @@ def create_baize_api_app(
             checks["auth_db"] = False
         # 3. 数据目录可写
         try:
-            from baize.config import DATA_DIR
-            checks["data_dir"] = Path(DATA_DIR).is_dir() and os.access(DATA_DIR, os.W_OK)
+            from baize.config import DEFAULT_BAIZE_DIR
+
+            checks["data_dir"] = (
+                Path(DEFAULT_BAIZE_DIR).is_dir() and os.access(DEFAULT_BAIZE_DIR, os.W_OK)
+            )
         except Exception:  # noqa: BLE001
             checks["data_dir"] = False
         # 4. 容器运行时可用（若已配置）
@@ -1376,7 +1635,10 @@ def create_baize_api_app(
         "/api/v1/sessions/{session_id}",
         dependencies=[Depends(_require_api_key)],
     )
-    def delete_session(session_id: str) -> dict:
+    async def delete_session(session_id: str) -> dict:
+        # 会话结束：先把整段轨迹沉淀为长期记忆（经验是长期资产，不随会话删除）。
+        # 必须在下面 session_logs.pop 之前调用，否则拿不到会话日志。
+        await _finalize_session_learning(app, session_id)
         ok = app.state.session_manager.delete_session(session_id)
         if not ok:
             raise HTTPException(status_code=404, detail="会话不存在")
@@ -1858,18 +2120,21 @@ def create_baize_api_app(
         session = app.state.session_manager.get_session(session_id)
         if session is None:
             raise HTTPException(status_code=404, detail="会话不存在")
-        return {"interrupted": True, "success": True}
+        cancelled = _cancel_session_run(session_id)
+        return {"interrupted": True, "success": True, "running_cancelled": cancelled}
 
     @app.post(
         "/api/v1/sessions/{session_id}/cancel",
         dependencies=[Depends(_require_api_key)],
     )
     def cancel_session(session_id: str) -> dict:
-        # 流式请求由前端 AbortController 中断；此处仅做会话存在性校验。
+        # 前端 AbortController 只断开自己的 SSE 连接，后端编排（LLM 请求 /
+        # agent 执行）仍在跑。真正停止需要置位取消信号并取消运行中的任务。
         session = app.state.session_manager.get_session(session_id)
         if session is None:
             raise HTTPException(status_code=404, detail="会话不存在")
-        return {"cancelled": True, "success": True}
+        cancelled = _cancel_session_run(session_id)
+        return {"cancelled": True, "success": True, "running_cancelled": cancelled}
 
     @app.post(
         "/api/v1/sessions/{session_id}/prompts/{prompt_id}/respond",
@@ -2121,6 +2386,22 @@ def create_baize_api_app(
                 for spec in registry.all()
                 if spec.name.startswith("shared_browser_")
             )
+        # ── 任务类型分流（用户约定）──
+        # general（通用对话）= 简单问答：直接用模型对话，不接入黑板/攻击图编排；
+        # ctf / pentest / forensics 继续走黑板驱动的多波编排（行为不变）。
+        if use_conversation_orchestrator \
+                and _resolve_task_type(session, payload.input) == "general":
+            use_conversation_orchestrator = False
+            if agent is None:
+                try:
+                    agent = _create_general_chat_agent(
+                        session_id, session_log, extra_tools
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.warning("通用对话 agent 构造失败，回退编排路径", exc_info=True)
+                    agent = None
+                    use_conversation_orchestrator = True
+
         # 多模态 user 消息（图片注入 content_parts，其它注入附件提示）
         user_chat_message = build_user_message(
             payload.input,
@@ -2135,9 +2416,35 @@ def create_baize_api_app(
             len(payload.input),
         )
 
-        # ── 中断续跑：用户输入"继续"类指令且历史中存在已执行内容时，
-        # 明确要求模型基于已有上下文继续，避免从头重复执行已完成步骤 ──
-        if _is_continue_intent(payload.input) and prior_history:
+        # ── 中断续跑 + follow-up 路由 ──
+        # 用户回复"继续"/编号/"生成 Writeup"时，改写用户输入为明确指令，
+        # 避免编排器把 follow-up 误判为新任务重新执行整个流程。
+        _follow_up = _parse_follow_up_intent(payload.input)
+        if _follow_up is not None and prior_history:
+            action, detail = _follow_up
+            if action == "writeup":
+                # 用户要求生成 Writeup → 强制走报告生成路径
+                _hint = (
+                    "\n\n（用户要求基于已有结论生成报告/Writeup。"
+                    "请直接调用 report 工具或生成完整报告文本，不要重复执行已完成的步骤。）"
+                )
+                if user_chat_message.content_parts:
+                    user_chat_message.content_parts.append({"type": "text", "text": _hint})
+                else:
+                    user_chat_message.content += _hint
+                # 标记为报告请求，让编排器跳过 Reason 直接产出报告
+                logger.info("follow-up: 用户请求生成 Writeup")
+            elif action == "continue" or action == "select":
+                _hint = (
+                    "\n\n（用户希望继续之前中断的任务。请基于以上已执行的对话与工具结果"
+                    "继续处理，不要重新执行已经完成过的步骤。）"
+                )
+                if user_chat_message.content_parts:
+                    user_chat_message.content_parts.append({"type": "text", "text": _hint})
+                else:
+                    user_chat_message.content += _hint
+        elif _is_continue_intent(payload.input) and prior_history:
+            # 兜底：parse 未命中但 is_continue 匹配（向后兼容）
             _hint = (
                 "\n\n（用户希望继续之前中断的任务。请基于以上已执行的对话与工具结果"
                 "继续处理，不要重新执行已经完成过的步骤。）"
@@ -2160,6 +2467,10 @@ def create_baize_api_app(
                 experience_block = recalled["block"]
         except Exception:  # noqa: BLE001
             logger.warning("记忆检索注入失败", exc_info=True)
+
+        # ── 会话级记忆学习：记录活跃时间，顺带把空闲超时的旧会话收尾学习 ──
+        app.state.session_last_active[session_id] = time.time()
+        _sweep_idle_session_learning(app)
 
         async def event_source():
             sm = app.state.session_manager
@@ -2250,8 +2561,15 @@ def create_baize_api_app(
 
                     node_index = {n.id: n for n in pipeline_def.nodes}
                     phase = 0
+                    # 接上会话取消信号：用户点停止后立即停止向前端推送事件
+                    _cancel_ev = _session_cancel.get(session_id)
+                    if _cancel_ev is None:
+                        _cancel_ev = asyncio.Event()
+                        _session_cancel[session_id] = _cancel_ev
                     async for kind, event in _with_sse_heartbeat(
-                        runner.subscribe_events(run_id), interval=15.0
+                        runner.subscribe_events(run_id),
+                        interval=15.0,
+                        cancel_event=_cancel_ev,
                     ):
                         if await request.is_disconnected():
                             break
@@ -2417,9 +2735,19 @@ def create_baize_api_app(
                                 )
                         except Exception:  # noqa: BLE001
                             pass
+                    # 通用对话（general）直连分支需要会话历史才能保持上下文，
+                    # 否则多轮追问时模型看不到前情（此前每轮都是孤立请求）
+                    _orch_history = None
+                    try:
+                        _orch_history = sm.get_messages(session_id)
+                    except Exception:  # noqa: BLE001
+                        _orch_history = getattr(session, "messages", None)
                     orch = ConversationOrchestrator()
                     # 心跳包装器在 finally 中会级联 aclose 内部编排器生成器，
                     # 从而取消正在运行的 agent / LLM 请求 / 浏览器协程。
+                    # 每次新请求都用全新的取消信号，避免被上一次的停止信号误伤
+                    _cancel_ev = asyncio.Event()
+                    _session_cancel[session_id] = _cancel_ev
                     stream = _with_sse_heartbeat(
                         orch.run(
                             blackboard,
@@ -2427,8 +2755,11 @@ def create_baize_api_app(
                             session_id=session_id,
                             session_log=session_log,
                             extra_tools=extra_tools,
+                            history=_orch_history,
+                            experience_block=experience_block,
                         ),
                         interval=10.0,
+                        cancel_event=_cancel_ev,
                     )
                     async for kind, event in stream:
                         if await request.is_disconnected():
@@ -2510,6 +2841,12 @@ def create_baize_api_app(
                 # 会话 ID 已在克隆副本上绑定（沙箱审批 / 记忆 / 审计日志均可识别当前会话）
                 # 流式对话（传入历史上下文 + 多模态 user 消息 + 附件工具 + 历史经验）
                 # 包一层 SSE 心跳：工具执行等静默期定期发送注释行保活，防止连接超时断开
+                # 接上会话取消信号：用户点停止后 aclose 会级联取消 agent 内部
+                # 的 LLM 请求与工具执行（此前停止按钮是空操作）
+                _cancel_ev = _session_cancel.get(session_id)
+                if _cancel_ev is None:
+                    _cancel_ev = asyncio.Event()
+                    _session_cancel[session_id] = _cancel_ev
                 async for kind, event in _with_sse_heartbeat(
                     agent.run_stream(
                         payload.input,
@@ -2519,6 +2856,7 @@ def create_baize_api_app(
                         experience_block=experience_block,
                     ),
                     interval=15.0,
+                    cancel_event=_cancel_ev,
                 ):
                     if await request.is_disconnected():
                         # 前端断开（切换页面/刷新）：保留已产生内容
@@ -2591,13 +2929,13 @@ def create_baize_api_app(
                         _flush_to_session()
                         # 评价闭环：本回合有结论 → 被注入的经验记为「有用」（提升后续排序）
                         if injected_exp_ids and (final_text or "").strip():
-                            for _eid in injected_exp_ids:
-                                try:
-                                    app.state.memory_service.record_feedback(
-                                        _eid, True, actor="agent",
-                                        note="注入后本回合产出结论")
-                                except Exception:  # noqa: BLE001
-                                    pass
+                            # 只给结论里真的引用到的经验记「有用」，避免 useful
+                            # 退化成命中次数的复制品（见 MemoryService.record_outcome）
+                            try:
+                                app.state.memory_service.record_outcome(
+                                    injected_exp_ids, final_text)
+                            except Exception:  # noqa: BLE001
+                                pass
                         yield f"data: {json.dumps({'type': 'done', 'content': event.content})}\n\n"
             except ModelNotConfiguredError as e:
                 yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
@@ -2986,6 +3324,19 @@ def create_baize_api_app(
         return {"ok": True}
 
     @app.post(
+        "/api/v1/memory/sessions/{session_id}/finalize",
+        response_model=dict,
+        dependencies=[Depends(_require_api_key)],
+    )
+    async def memory_session_finalize(session_id: str) -> dict:
+        """手动触发某会话的记忆学习（把整段会话轨迹沉淀为 Episode + 经验）。
+
+        正常情况下删除会话或会话空闲超时会自动触发；这里提供显式入口，
+        便于在不删除会话的前提下立即沉淀。同一会话只会学习一次。
+        """
+        return await _finalize_session_learning(app, session_id)
+
+    @app.post(
         "/api/v1/memory/consolidate",
         response_model=dict,
         dependencies=[Depends(_require_api_key)],
@@ -3003,6 +3354,25 @@ def create_baize_api_app(
         if out is None:
             raise HTTPException(status_code=400, detail="没有可合并的 active/draft 经验")
         return {"result": out}
+
+    @app.post(
+        "/api/v1/memory/embed-pending",
+        response_model=dict,
+        dependencies=[Depends(_require_api_key)],
+    )
+    async def memory_embed_pending(limit: int = 100) -> dict:
+        """为缺向量（或向量已过期）的经验补算 embedding。
+
+        语义检索是可选的：只配了 BAIZE_EMBEDDING_BASE_URL / MODEL 时才生效。
+        启用之后，此前写入的存量经验都没有向量，需要跑一次这个接口补上；
+        未配置时直接返回 0，不发任何网络请求。
+        """
+        svc = _memory()
+        n = await svc.embed_pending(limit=max(1, min(int(limit), 500)))
+        em = svc.embedding_client
+        return {"embedded": n,
+                "configured": bool(em and em.configured()),
+                "enabled": bool(em and em.enabled())}
 
     # ---- Episode（任务轨迹） -------------------------------------------------
     @app.get(
@@ -3077,6 +3447,33 @@ def create_baize_api_app(
     def memory_graph() -> dict:
         """时间知识图谱 + 内容节点快照（供记忆可视化）。"""
         return _memory().graph_snapshot()
+
+    @app.get(
+        "/api/v1/memory/explore",
+        response_model=dict,
+        dependencies=[Depends(_require_api_key)],
+    )
+    def memory_explore(q: str = "", limit: int = 20) -> dict:
+        """围绕一个知识概念浏览本体：近邻概念 + 挂在其上的经验。
+
+        与 /memory/search 的区别：search 回答「这句话该注入什么经验」，
+        explore 回答「这个概念在知识库里周围有什么」，供人查看与排查召回。
+        """
+        return _memory().explore(q.strip(), limit=max(1, min(limit, 100)))
+
+    @app.post(
+        "/api/v1/memory/purge-assets",
+        response_model=dict,
+        dependencies=[Depends(_require_api_key)],
+    )
+    def memory_purge_assets() -> dict:
+        """清理历史落库的资产实体（IP / 域名 / 产品版本）及其边。
+
+        目标资产不该长期留在记忆库里：换任务即失效，且属于客户敏感信息。抽取
+        侧已停抽，但已落库的数据不会自己消失，故提供显式清理入口（只动图谱，
+        不动经验正文）。
+        """
+        return _memory().purge_assets()
 
     # ------------------------------------------------------------------
     # 模型列表（单模型模式：返回当前配置的模型）
